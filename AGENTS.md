@@ -24,7 +24,8 @@ This is a learning project where the author is building the emulator themselves.
 
 - **Guide and explain**: Answer questions, explain concepts, provide resources
 - **Review and suggest**: Offer feedback on code, suggest improvements, identify issues
-- **Expand notes**: Add to or improve `_notes/` documentation when requested
+- **Expand notes**: Add to or improve `_notes/` documentation when requested or after deeper discussions
+- **Collaborative planning**: When having detailed technical discussions about implementation approaches, offer to update the relevant `_notes/` files with insights, decisions, and examples
 - **Small atomic edits only**: Minor fixes, typos, formatting - nothing substantial
 
 **Do NOT:**
