@@ -687,11 +687,467 @@ Use community test ROMs:
 
 ### Gameboy Color Support
 
-Add to later phases:
-- Double CPU speed mode
-- Color palettes
-- Additional WRAM banks
-- HDMA (DMA during HBlank)
+The Game Boy Color (GBC) is a **natural extension** of your DMG emulator, not a rewrite. The core architecture you're building now will support GBC with approximately 20-30% additional work. This section explains what changes and how your DMG foundation evolves.
+
+#### Key Principle: Extension, Not Replacement
+
+GBC maintains **full backward compatibility** with DMG. This means:
+- Same CPU (Sharp LR35902)
+- Same instruction set (all 512 opcodes)
+- Same basic memory map structure
+- Same rendering concepts (tiles, sprites, etc.)
+
+Your emulator will run in one of two modes:
+```rust
+enum EmulatorMode {
+    Dmg,  // Original Game Boy
+    Cgb,  // Game Boy Color
+}
+```
+
+Most of your code becomes:
+```rust
+match self.mode {
+    EmulatorMode::Dmg => { /* Your existing DMG logic */ }
+    EmulatorMode::Cgb => { /* Extended GBC logic */ }
+}
+```
+
+---
+
+#### What Changes: Component by Component
+
+##### **CPU & Registers: Zero Changes** ✅
+
+The CPU is identical. Your Phase 1 register implementation works for both:
+- Same 8-bit registers (A, F, B, C, D, E, H, L)
+- Same 16-bit registers (SP, PC)
+- Same flags (Z, N, H, C)
+- Same instruction execution
+
+**New feature:** CPU speed switching
+```rust
+// Add to your CPU or system struct
+enum CpuSpeed {
+    Normal,  // 4.194 MHz (DMG speed)
+    Double,  // 8.388 MHz (GBC only)
+}
+
+// New I/O register: 0xFF4D (KEY1) - Speed switch
+// Writing 0x01 and executing STOP switches speed
+```
+
+**Impact:** Minimal. Add speed mode enum, multiply cycle counts when in double speed.
+
+---
+
+##### **MMU: Bank Extensions**
+
+###### **Work RAM (WRAM) Banking**
+
+**DMG:**
+```rust
+struct Mmu {
+    wram: [u8; 0x2000],  // 8KB fixed
+}
+
+impl Mmu {
+    pub fn read(&self, addr: u16) -> u8 {
+        match addr {
+            0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
+            // ...
+        }
+    }
+}
+```
+
+**GBC Extension:**
+```rust
+struct Mmu {
+    wram: [[u8; 0x1000]; 8],  // 8 banks of 4KB = 32KB
+    wram_bank: u8,             // Current bank (1-7), bank 0 is fixed
+}
+
+impl Mmu {
+    pub fn read(&self, addr: u16) -> u8 {
+        match addr {
+            0xC000..=0xCFFF => {
+                // Bank 0 (fixed)
+                self.wram[0][(addr - 0xC000) as usize]
+            }
+            0xD000..=0xDFFF => {
+                // Switchable bank (1-7)
+                let bank = if self.mode == EmulatorMode::Cgb {
+                    self.wram_bank.max(1) // Banks 1-7
+                } else {
+                    1 // DMG only has bank 1
+                };
+                self.wram[bank as usize][(addr - 0xD000) as usize]
+            }
+            // New register: 0xFF70 (SVBK) - WRAM bank select
+            0xFF70 => self.wram_bank,
+            // ...
+        }
+    }
+}
+```
+
+###### **Video RAM (VRAM) Banking**
+
+**DMG:**
+```rust
+vram: [u8; 0x2000],  // 8KB single bank
+```
+
+**GBC Extension:**
+```rust
+vram: [[u8; 0x2000]; 2],  // 2 banks of 8KB = 16KB
+vram_bank: u8,             // 0 or 1
+
+// New register: 0xFF4F (VBK) - VRAM bank select
+// Bank 0: Tile data (same as DMG)
+// Bank 1: Tile attributes (GBC only)
+```
+
+**Impact:** Moderate. Replace single arrays with banked arrays, add bank selection registers.
+
+---
+
+##### **PPU: Color Palettes and Attributes**
+
+This is the most visible change, but follows DMG concepts closely.
+
+###### **Color System**
+
+**DMG:** 4 shades of gray per palette
+```rust
+type Color = u8;  // 0-3 (grayscale)
+
+fn lookup_palette(&self, palette_index: u8) -> Color {
+    // Convert 2-bit index to grayscale
+    match palette_index {
+        0 => 255,  // White
+        1 => 192,  // Light gray
+        2 => 96,   // Dark gray
+        3 => 0,    // Black
+    }
+}
+```
+
+**GBC:** 32,768 colors (15-bit RGB)
+```rust
+#[derive(Copy, Clone)]
+struct Rgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+type Color = Rgb;
+
+struct Ppu {
+    bg_palette_ram: [u8; 64],   // 8 palettes × 4 colors × 2 bytes
+    obj_palette_ram: [u8; 64],  // 8 palettes × 4 colors × 2 bytes
+    // ...
+}
+
+fn lookup_palette(&self, palette_index: u8, palette_num: u8, is_bg: bool) -> Color {
+    let palette_ram = if is_bg { &self.bg_palette_ram } else { &self.obj_palette_ram };
+    let offset = (palette_num * 8) + (palette_index * 2);
+    
+    let lo = palette_ram[offset as usize];
+    let hi = palette_ram[(offset + 1) as usize];
+    let bgr555 = (hi as u16) << 8 | lo as u16;
+    
+    // Convert BGR555 to RGB888
+    let r = ((bgr555 & 0x001F) << 3) as u8;
+    let g = (((bgr555 & 0x03E0) >> 5) << 3) as u8;
+    let b = (((bgr555 & 0x7C00) >> 10) << 3) as u8;
+    
+    Rgb { r, g, b }
+}
+
+// New registers:
+// 0xFF68 (BCPS): Background palette index
+// 0xFF69 (BCPD): Background palette data
+// 0xFF6A (OCPS): Object palette index
+// 0xFF6B (OCPD): Object palette data
+```
+
+###### **Tile Attributes (VRAM Bank 1)**
+
+DMG tiles have no attributes. GBC adds per-tile attributes stored in VRAM bank 1:
+
+```rust
+// When rendering a tile in GBC mode
+let tile_data = self.vram[0][tile_addr];       // Bank 0: tile pixels
+let tile_attr = self.vram[1][tile_addr];       // Bank 1: attributes
+
+// Attribute byte format:
+// Bit 7: Priority (BG-to-OAM priority)
+// Bit 6: Y flip
+// Bit 5: X flip
+// Bit 4: VRAM bank (for tile data)
+// Bit 3: Palette bank (0 = BCPx 0-7, 1 = BCPx 8-15)
+// Bit 2-0: Color palette number (0-7)
+
+let priority = tile_attr & 0x80 != 0;
+let y_flip = tile_attr & 0x40 != 0;
+let x_flip = tile_attr & 0x20 != 0;
+let tile_vram_bank = (tile_attr & 0x10) >> 4;
+let palette_num = tile_attr & 0x07;
+```
+
+**Impact:** Significant for PPU, but extends existing rendering logic. DMG path remains unchanged.
+
+---
+
+##### **Timing: Double Speed Mode**
+
+**Implementation:**
+```rust
+struct Cpu {
+    speed_mode: CpuSpeed,
+    speed_switch_armed: bool,  // KEY1 bit 0
+}
+
+fn get_cpu_frequency(&self) -> u32 {
+    match self.speed_mode {
+        CpuSpeed::Normal => 4_194_304,
+        CpuSpeed::Double => 8_388_608,
+    }
+}
+
+// When STOP instruction executed with speed_switch_armed = true
+fn execute_stop(&mut self) {
+    if self.speed_switch_armed {
+        self.speed_mode = match self.speed_mode {
+            CpuSpeed::Normal => CpuSpeed::Double,
+            CpuSpeed::Double => CpuSpeed::Normal,
+        };
+        self.speed_switch_armed = false;
+    }
+}
+```
+
+**Impact:** Minor. Add speed mode tracking, adjust timing calculations.
+
+---
+
+##### **New Registers Summary**
+
+| Address | Name | Purpose |
+|---------|------|---------|
+| 0xFF4D | KEY1 | CPU speed switch |
+| 0xFF4F | VBK | VRAM bank select (0-1) |
+| 0xFF68 | BCPS | Background palette index |
+| 0xFF69 | BCPD | Background palette data |
+| 0xFF6A | OCPS | Object palette index |
+| 0xFF6B | OCPD | Object palette data |
+| 0xFF70 | SVBK | WRAM bank select (0-7) |
+
+**Impact:** Add ~7 new I/O register handlers to MMU.
+
+---
+
+#### Additional GBC Features
+
+##### **HDMA (HBlank DMA)**
+
+Allows copying data during HBlank for smoother updates:
+```rust
+// Registers: 0xFF51-0xFF55
+struct Hdma {
+    source: u16,
+    destination: u16,
+    length: u16,
+    mode: HdmaMode,  // General purpose or HBlank
+}
+
+// During HBlank, copy 0x10 bytes
+fn hblank_dma_transfer(&mut self) {
+    if self.hdma.active {
+        for _ in 0..0x10 {
+            let byte = self.read(self.hdma.source);
+            self.write(self.hdma.destination, byte);
+            self.hdma.source += 1;
+            self.hdma.destination += 1;
+        }
+    }
+}
+```
+
+##### **Infrared Port**
+
+Optional communication feature:
+```rust
+// Register: 0xFF56 (RP) - Infrared port
+// Can be stubbed or fully implemented
+```
+
+---
+
+#### Backward Compatibility: Running DMG Games on GBC
+
+GBC hardware can detect DMG cartridges and run in compatibility mode:
+
+```rust
+fn detect_mode(cartridge: &Cartridge) -> EmulatorMode {
+    // Check cartridge header byte 0x0143
+    match cartridge.cgb_flag {
+        0x80 => EmulatorMode::Cgb,  // GBC enhanced (supports both)
+        0xC0 => EmulatorMode::Cgb,  // GBC only
+        _ => EmulatorMode::Dmg,     // DMG only
+    }
+}
+
+// When running in DMG mode on GBC hardware:
+// - Use DMG memory sizes (no banking)
+// - Use DMG grayscale palettes
+// - Run at normal speed only
+// - Ignore GBC-specific registers
+```
+
+---
+
+#### Implementation Strategy
+
+##### **Phase 1-7: Build Complete DMG Emulator**
+
+Focus entirely on DMG. Don't add GBC code yet.
+
+**Design choices that help:**
+```rust
+// Good: Use type alias for color
+type Color = u8;  // Easy to change to Rgb later
+
+// Good: Separate palette lookup
+fn get_pixel_color(&self, palette_idx: u8) -> Color;
+
+// Good: Use enums for clarity
+enum VramBank { Bank0, Bank1 }
+```
+
+##### **Post-Phase 7: Add GBC Support**
+
+**Step 1: Add mode enum**
+```rust
+enum EmulatorMode { Dmg, Cgb }
+```
+
+**Step 2: Extend memory**
+```rust
+// Before: wram: [u8; 0x2000]
+// After:  wram: [[u8; 0x1000]; 8]
+```
+
+**Step 3: Add color palettes**
+```rust
+struct Ppu {
+    bg_palette_ram: [u8; 64],
+    obj_palette_ram: [u8; 64],
+}
+```
+
+**Step 4: Update rendering**
+```rust
+match self.mode {
+    EmulatorMode::Dmg => { /* existing grayscale logic */ }
+    EmulatorMode::Cgb => { /* new color logic */ }
+}
+```
+
+**Step 5: Add new I/O registers**
+
+**Step 6: Test with GBC ROMs**
+
+---
+
+#### Code Organization for GBC
+
+```rust
+// Keep DMG and GBC logic separate
+mod ppu {
+    mod dmg_render;  // Original DMG rendering
+    mod cgb_render;  // GBC color rendering
+    
+    pub fn render_scanline(&mut self) {
+        match self.mode {
+            EmulatorMode::Dmg => dmg_render::render_scanline(self),
+            EmulatorMode::Cgb => cgb_render::render_scanline(self),
+        }
+    }
+}
+```
+
+---
+
+#### Testing GBC
+
+**Test ROMs:**
+- DMG games on GBC emulator (backward compatibility)
+- GBC-only games
+- GBC-enhanced games (support both modes)
+
+**Key test cases:**
+- WRAM banking (write to bank 3, switch to bank 5, verify independence)
+- VRAM banking (tile data vs attributes)
+- Color palette accuracy (compare screenshots)
+- Speed switching (timing-sensitive games)
+
+---
+
+#### Effort Estimate
+
+Based on typical emulator development:
+
+| Component | DMG Effort | GBC Additional | % Increase |
+|-----------|------------|----------------|------------|
+| CPU | 100% | 0% | +0% |
+| Registers | 100% | 0% | +0% |
+| MMU | 100% | 15% | +15% |
+| PPU | 100% | 40% | +40% |
+| Timing | 100% | 10% | +10% |
+| **Overall** | **100%** | **~25%** | **+25%** |
+
+**Timeline:** If DMG takes 8 weeks, GBC adds approximately 2 weeks.
+
+---
+
+#### When NOT to Add GBC
+
+Don't add GBC support if:
+- Your DMG emulator isn't passing Blargg's test ROMs
+- DMG graphics aren't rendering correctly
+- You haven't completed Phase 7
+- You're still learning basic emulation concepts
+
+**Reason:** GBC adds complexity. Master DMG first, then extend.
+
+---
+
+#### Summary: DMG to GBC Evolution
+
+**What stays the same:**
+- ✅ CPU architecture
+- ✅ Instruction set
+- ✅ Basic memory map
+- ✅ Rendering concepts
+- ✅ Timing concepts
+
+**What extends:**
+- 🔄 Memory sizes (banks added)
+- 🔄 Color system (grayscale → RGB)
+- 🔄 PPU attributes (none → per-tile)
+- 🔄 Speed modes (fixed → switchable)
+
+**What's new:**
+- ✨ Palette RAM
+- ✨ HDMA transfers
+- ✨ Mode detection
+- ✨ ~7 new registers
+
+**Architecture impact:** Your well-structured DMG emulator naturally extends to GBC. Think of it as adding features, not rebuilding.
 
 ### Save States
 
