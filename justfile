@@ -20,3 +20,9 @@ fmt-check:
 
 run:
     cargo run
+
+blargg:
+    cargo test --test blargg -- --ignored
+
+blargg-verbose:
+    cargo test --test blargg -- --ignored --nocapture
