@@ -45,6 +45,29 @@ impl Cpu {
     /// ```
     fn execute(&mut self, opcode: u8, bus: &mut Bus) -> u8 {
         match opcode {
+            0x00 => 4, // NOP
+
+            0x03 | 0x13 | 0x23 | 0x33 => {
+                // INC rr
+                let pair = (opcode >> 4) & 0b11;
+                self.inc_rr(pair);
+                8
+            }
+
+            0x0B | 0x1B | 0x2B | 0x3B => {
+                // DEC rr
+                let pair = (opcode >> 4) & 0b11;
+                self.dec_rr(pair);
+                8
+            }
+
+            0x09 | 0x19 | 0x29 | 0x39 => {
+                // ADD HL, rr
+                let pair = (opcode >> 4) & 0b11;
+                self.add_hl_rr(pair);
+                8
+            }
+
             0x3E => {
                 self.registers.a = self.imm8(bus);
                 8
@@ -125,8 +148,6 @@ impl Cpu {
                 8
             }
 
-            0x00 => 4, // NOP
-
             _ => panic!("Unimplemented opcode: 0x{opcode:02X}"),
         }
     }
@@ -175,6 +196,48 @@ impl Cpu {
             7 => self.registers.a = value,
             _ => unreachable!(),
         }
+    }
+
+    #[must_use]
+    fn read_rr(&self, pair: u8) -> u16 {
+        match pair {
+            0 => self.registers.bc(),
+            1 => self.registers.de(),
+            2 => self.registers.hl(),
+            3 => self.registers.sp,
+            _ => unreachable!(),
+        }
+    }
+
+    fn write_rr(&mut self, pair: u8, value: u16) {
+        match pair {
+            0 => self.registers.set_bc(value),
+            1 => self.registers.set_de(value),
+            2 => self.registers.set_hl(value),
+            3 => self.registers.sp = value,
+            _ => unreachable!(),
+        }
+    }
+
+    fn inc_rr(&mut self, pair: u8) {
+        let value = self.read_rr(pair);
+        self.write_rr(pair, value.wrapping_add(1));
+    }
+
+    fn dec_rr(&mut self, pair: u8) {
+        let value = self.read_rr(pair);
+        self.write_rr(pair, value.wrapping_sub(1));
+    }
+
+    fn add_hl_rr(&mut self, pair: u8) {
+        let hl = self.registers.hl();
+        let value = self.read_rr(pair);
+        let result = hl.wrapping_add(value);
+        self.registers.set_hl(result);
+        self.registers.set_subtract(false);
+        self.registers
+            .set_half_carry((hl & 0x0FFF) + (value & 0x0FFF) > 0x0FFF);
+        self.registers.set_carry(hl > 0xFFFF - value);
     }
 }
 
@@ -573,5 +636,291 @@ mod tests {
 
         cpu.step(&mut bus); // ADD A, B
         assert_eq!(cpu.registers.a, 0x11);
+    }
+
+    #[test]
+    fn test_inc_rr() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_bc(0x0001);
+        bus.write(0x0000, 0x03); // INC BC
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers.bc(), 0x0002);
+    }
+
+    #[test]
+    fn test_inc_rr_overflow() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0xFFFF);
+        cpu.registers.set_zero(true);
+        cpu.registers.set_subtract(true);
+        cpu.registers.set_half_carry(true);
+        cpu.registers.set_carry(true);
+        bus.write(0x0000, 0x23); // INC HL
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x0000);
+        // INC rr does not affect any flags.
+        assert!(cpu.registers.zero());
+        assert!(cpu.registers.subtract());
+        assert!(cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_inc_rr_preserves_flags() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_bc(0x0001);
+        cpu.registers.set_zero(true);
+        cpu.registers.set_subtract(true);
+        cpu.registers.set_half_carry(true);
+        cpu.registers.set_carry(true);
+        bus.write(0x0000, 0x03); // INC BC
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.bc(), 0x0002);
+        // INC rr does not affect any flags.
+        assert!(cpu.registers.zero());
+        assert!(cpu.registers.subtract());
+        assert!(cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_dec_rr() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_de(0x0002);
+        bus.write(0x0000, 0x1B); // DEC DE
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers.de(), 0x0001);
+    }
+
+    #[test]
+    fn test_dec_rr_underflow() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.sp = 0x0000;
+        cpu.registers.set_zero(true);
+        cpu.registers.set_subtract(true);
+        cpu.registers.set_half_carry(true);
+        cpu.registers.set_carry(true);
+        bus.write(0x0000, 0x3B); // DEC SP
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.sp, 0xFFFF);
+        // DEC rr does not affect any flags.
+        assert!(cpu.registers.zero());
+        assert!(cpu.registers.subtract());
+        assert!(cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_dec_rr_preserves_flags() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_bc(0x0001);
+        cpu.registers.set_zero(true);
+        cpu.registers.set_subtract(true);
+        cpu.registers.set_half_carry(true);
+        cpu.registers.set_carry(true);
+        bus.write(0x0000, 0x0B); // DEC BC
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.bc(), 0x0000);
+        // DEC rr does not affect any flags.
+        assert!(cpu.registers.zero());
+        assert!(cpu.registers.subtract());
+        assert!(cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x1234);
+        cpu.registers.set_bc(0x5678);
+        bus.write(0x0000, 0x09); // ADD HL, BC
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers.hl(), 0x68AC);
+        assert!(!cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(!cpu.registers.half_carry());
+        assert!(!cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_zero_result_preserves_z() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x0000);
+        cpu.registers.set_bc(0x0000);
+        cpu.registers.set_zero(true);
+        bus.write(0x0000, 0x09); // ADD HL, BC
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x0000);
+        assert!(cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(!cpu.registers.half_carry());
+        assert!(!cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_carry() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x8000);
+        cpu.registers.set_zero(false);
+        bus.write(0x0000, 0x29); // ADD HL, HL
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x0000);
+        assert!(!cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(!cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_half_carry() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x0FFF);
+        cpu.registers.set_bc(0x0001);
+        bus.write(0x0000, 0x09); // ADD HL, BC
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x1000);
+        assert!(!cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(cpu.registers.half_carry());
+        assert!(!cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_preserves_z() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x0001);
+        cpu.registers.set_de(0x0001);
+        cpu.registers.set_zero(true);
+        bus.write(0x0000, 0x19); // ADD HL, DE
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x0002);
+        // ADD HL, rr does not affect Z.
+        assert!(cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(!cpu.registers.half_carry());
+        assert!(!cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_sp() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x1000);
+        cpu.registers.sp = 0x0200;
+        bus.write(0x0000, 0x39); // ADD HL, SP
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers.hl(), 0x1200);
+        assert_eq!(cpu.registers.sp, 0x0200);
+        assert!(!cpu.registers.subtract());
+        assert!(!cpu.registers.half_carry());
+        assert!(!cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_both_h_and_c() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x8FFF);
+        bus.write(0x0000, 0x29); // ADD HL, HL
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x1FFE);
+        assert!(!cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_add_hl_rr_sp_carry() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0xF000);
+        cpu.registers.sp = 0x1000;
+        bus.write(0x0000, 0x39); // ADD HL, SP
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x0000);
+        assert!(!cpu.registers.zero());
+        assert!(!cpu.registers.subtract());
+        assert!(!cpu.registers.half_carry());
+        assert!(cpu.registers.carry());
+    }
+
+    #[test]
+    fn test_inc_rr_de() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_de(0x1234);
+        bus.write(0x0000, 0x13); // INC DE
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.de(), 0x1235);
+    }
+
+    #[test]
+    fn test_inc_rr_sp() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.sp = 0xFFFE;
+        bus.write(0x0000, 0x33); // INC SP
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.sp, 0xFFFF);
+    }
+
+    #[test]
+    fn test_dec_rr_hl() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.set_hl(0x0100);
+        bus.write(0x0000, 0x2B); // DEC HL
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.registers.hl(), 0x00FF);
     }
 }
