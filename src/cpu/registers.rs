@@ -41,7 +41,8 @@ pub struct Registers {
 }
 
 impl Registers {
-    /// new initializes all registers to zero
+    /// `new` initializes all registers to zero
+    #[must_use]
     pub fn new() -> Self {
         Registers {
             a: 0,
@@ -57,45 +58,54 @@ impl Registers {
         }
     }
 
+    #[must_use]
     pub fn af(&self) -> u16 {
-        ((self.a as u16) << 8) | ((self.f & 0xF0) as u16)
+        (u16::from(self.a) << 8) | u16::from(self.f & 0xF0)
     }
 
-    /// set_af sets the AF register pair
+    /// `set_af` sets the AF register pair
     /// Writes the high byte to A and the low byte to F
     /// When setting the F register, the lower 4 bits are masked to 0
+    #[allow(clippy::cast_possible_truncation)]
     pub fn set_af(&mut self, value: u16) {
         self.a = (value >> 8) as u8;
         self.f = (value as u8) & 0xF0;
     }
 
+    #[must_use]
     pub fn bc(&self) -> u16 {
-        ((self.b as u16) << 8) | (self.c as u16)
+        (u16::from(self.b) << 8) | u16::from(self.c)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn set_bc(&mut self, value: u16) {
         self.b = (value >> 8) as u8;
         self.c = value as u8;
     }
 
+    #[must_use]
     pub fn de(&self) -> u16 {
-        ((self.d as u16) << 8) | (self.e as u16)
+        (u16::from(self.d) << 8) | u16::from(self.e)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn set_de(&mut self, value: u16) {
         self.d = (value >> 8) as u8;
         self.e = value as u8;
     }
 
+    #[must_use]
     pub fn hl(&self) -> u16 {
-        ((self.h as u16) << 8) | (self.l as u16)
+        (u16::from(self.h) << 8) | u16::from(self.l)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn set_hl(&mut self, value: u16) {
         self.h = (value >> 8) as u8;
         self.l = value as u8;
     }
 
+    #[must_use]
     pub fn zero(&self) -> bool {
         (self.f & FLAG_ZERO) != 0
     }
@@ -108,6 +118,7 @@ impl Registers {
         }
     }
 
+    #[must_use]
     pub fn subtract(&self) -> bool {
         (self.f & FLAG_SUBTRACT) != 0
     }
@@ -120,6 +131,7 @@ impl Registers {
         }
     }
 
+    #[must_use]
     pub fn half_carry(&self) -> bool {
         (self.f & FLAG_HALF_CARRY) != 0
     }
@@ -132,6 +144,7 @@ impl Registers {
         }
     }
 
+    #[must_use]
     pub fn carry(&self) -> bool {
         (self.f & FLAG_CARRY) != 0
     }
@@ -254,45 +267,45 @@ mod tests {
     #[test]
     fn test_zero_flag_getter_setter() {
         let mut registers = Registers::new();
-        assert_eq!(registers.zero(), false);
+        assert!(!registers.zero());
         registers.set_zero(true);
-        assert_eq!(registers.zero(), true);
+        assert!(registers.zero());
         assert_eq!(registers.f, 0b1000_0000);
         registers.set_zero(false);
-        assert_eq!(registers.zero(), false);
+        assert!(!registers.zero());
     }
 
     #[test]
     fn test_subtract_flag_getter_and_setter() {
         let mut registers = Registers::new();
-        assert_eq!(registers.subtract(), false);
+        assert!(!registers.subtract());
         registers.set_subtract(true);
-        assert_eq!(registers.subtract(), true);
+        assert!(registers.subtract());
         assert_eq!(registers.f, 0b0100_0000);
         registers.set_subtract(false);
-        assert_eq!(registers.subtract(), false);
+        assert!(!registers.subtract());
     }
 
     #[test]
     fn test_half_carry_flag_getter_and_setter() {
         let mut registers = Registers::new();
-        assert_eq!(registers.half_carry(), false);
+        assert!(!registers.half_carry());
         registers.set_half_carry(true);
-        assert_eq!(registers.half_carry(), true);
+        assert!(registers.half_carry());
         assert_eq!(registers.f, 0b0010_0000);
         registers.set_half_carry(false);
-        assert_eq!(registers.half_carry(), false);
+        assert!(!registers.half_carry());
     }
 
     #[test]
     fn test_carry_flag_getter_and_setter() {
         let mut registers = Registers::new();
-        assert_eq!(registers.carry(), false);
+        assert!(!registers.carry());
         registers.set_carry(true);
-        assert_eq!(registers.carry(), true);
+        assert!(registers.carry());
         assert_eq!(registers.f, 0b0001_0000);
         registers.set_carry(false);
-        assert_eq!(registers.carry(), false);
+        assert!(!registers.carry());
     }
 
     #[test]
@@ -307,14 +320,14 @@ mod tests {
 
         // clear zero flag
         registers.set_zero(false);
-        assert_eq!(registers.zero(), false);
-        assert_eq!(registers.carry(), true);
+        assert!(!registers.zero());
+        assert!(registers.carry());
         assert_eq!(registers.f, 0b0001_0000);
 
         // set subtract flag and make sure carry is still set
         registers.set_subtract(true);
-        assert_eq!(registers.carry(), true);
-        assert_eq!(registers.subtract(), true);
+        assert!(registers.carry());
+        assert!(registers.subtract());
         assert_eq!(registers.f, 0b0101_0000);
     }
 

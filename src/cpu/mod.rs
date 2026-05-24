@@ -7,6 +7,7 @@ pub struct Cpu {
 }
 
 impl Cpu {
+    #[must_use]
     pub fn new() -> Self {
         Cpu {
             registers: Registers::new(),
