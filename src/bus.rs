@@ -24,6 +24,14 @@ const TMA_ADDR: u16 = 0xFF06;
 const TAC_ADDR: u16 = 0xFF07;
 const IF_ADDR: u16 = 0xFF0F;
 const IE_ADDR: u16 = 0xFFFF;
+const ECHO_RAM_START: u16 = 0xE000;
+const ECHO_RAM_END: u16 = 0xFDFF;
+const ECHO_RAM_OFFSET: u16 = 0x2000;
+const UNUSABLE_START: u16 = 0xFEA0;
+const UNUSABLE_END: u16 = 0xFEFF;
+// Temporary scaffold policy for the unusable FEA0-FEFF range.
+// Hardware behavior varies by model and timing; refine once PPU/MMIO timing is modeled.
+const UNUSABLE_READ_VALUE: u8 = 0xFF;
 const INTERRUPT_MASK: u8 = 0x1F;
 const JOYPAD_INTERRUPT_BIT: u8 = 0b0001_0000;
 const TIMER_INTERRUPT_BIT: u8 = 0b0000_0100;
@@ -61,6 +69,10 @@ impl Bus {
     pub fn read(&self, address: u16) -> u8 {
         match address {
             JOYP_ADDR => self.joyp_value(),
+            UNUSABLE_START..=UNUSABLE_END => UNUSABLE_READ_VALUE,
+            ECHO_RAM_START..=ECHO_RAM_END => {
+                self.memory[usize::from(Self::mirror_echo_address(address))]
+            }
             _ => self.memory[usize::from(address)],
         }
     }
@@ -87,6 +99,10 @@ impl Bus {
                     self.last_tac = normalized;
                 }
                 self.memory[usize::from(TAC_ADDR)] = value;
+            }
+            UNUSABLE_START..=UNUSABLE_END => {}
+            ECHO_RAM_START..=ECHO_RAM_END => {
+                self.memory[usize::from(Self::mirror_echo_address(address))] = value;
             }
             _ => {
                 self.memory[usize::from(address)] = value;
@@ -187,6 +203,12 @@ impl Bus {
             self.request_interrupt(JOYPAD_INTERRUPT_BIT);
         }
     }
+
+    #[must_use]
+    fn mirror_echo_address(address: u16) -> u16 {
+        debug_assert!((ECHO_RAM_START..=ECHO_RAM_END).contains(&address));
+        address - ECHO_RAM_OFFSET
+    }
 }
 
 const fn timer_period(tac: u8) -> u16 {
@@ -215,6 +237,150 @@ mod tests {
         let bus = Bus::new();
         assert_eq!(bus.read(0x0000), 0x00);
         assert_eq!(bus.read(0xFFFF), 0x00);
+    }
+
+    #[test]
+    fn test_echo_ram_mirrors_wram_reads_and_writes() {
+        let mut bus = Bus::new();
+
+        bus.write(0xC123, 0x42);
+        assert_eq!(bus.read(0xE123), 0x42);
+
+        bus.write(0xE123, 0x99);
+        assert_eq!(bus.read(0xC123), 0x99);
+    }
+
+    #[test]
+    fn test_echo_ram_mirror_boundary_addresses() {
+        let mut bus = Bus::new();
+
+        bus.write(0xE000, 0x12);
+        bus.write(0xFDFF, 0x34);
+
+        assert_eq!(bus.read(0xC000), 0x12);
+        assert_eq!(bus.read(0xDDFF), 0x34);
+
+        bus.write(0xC000, 0x56);
+        bus.write(0xDDFF, 0x78);
+
+        assert_eq!(bus.read(0xE000), 0x56);
+        assert_eq!(bus.read(0xFDFF), 0x78);
+    }
+
+    #[test]
+    fn test_echo_ram_fenceposts_do_not_bleed_into_neighbors() {
+        let mut bus = Bus::new();
+
+        bus.write(0xDFFF, 0x11);
+        bus.write(0xE000, 0x22);
+        bus.write(0xFDFF, 0x33);
+        bus.write(0xFE00, 0x44);
+
+        assert_eq!(bus.read(0xDFFF), 0x11);
+        assert_eq!(bus.read(0xC000), 0x22);
+        assert_eq!(bus.read(0xE000), 0x22);
+        assert_eq!(bus.read(0xDDFF), 0x33);
+        assert_eq!(bus.read(0xFDFF), 0x33);
+        assert_eq!(bus.read(0xFE00), 0x44);
+        assert_eq!(bus.read(0xDE00), 0x00);
+    }
+
+    #[test]
+    fn test_unusable_area_read_policy_and_write_ignored() {
+        let mut bus = Bus::new();
+
+        assert_eq!(bus.read(0xFEA0), UNUSABLE_READ_VALUE);
+        assert_eq!(bus.read(0xFEFF), UNUSABLE_READ_VALUE);
+
+        bus.write(0xFEA0, 0x12);
+        bus.write(0xFEFF, 0x34);
+
+        assert_eq!(bus.read(0xFEA0), UNUSABLE_READ_VALUE);
+        assert_eq!(bus.read(0xFEFF), UNUSABLE_READ_VALUE);
+    }
+
+    #[test]
+    fn test_unusable_area_boundaries_do_not_affect_neighbors() {
+        let mut bus = Bus::new();
+
+        let joyp_before = bus.read(0xFF00);
+        bus.write(0xFE9F, 0x66);
+        assert_eq!(bus.read(0xFEA0), UNUSABLE_READ_VALUE);
+
+        bus.write(0xFEA1, 0x12);
+        bus.write(0xFEFF, 0x34);
+
+        assert_eq!(bus.read(0xFE9F), 0x66);
+        assert_eq!(bus.read(0xFEA1), UNUSABLE_READ_VALUE);
+        assert_eq!(bus.read(0xFEFF), UNUSABLE_READ_VALUE);
+        assert_eq!(bus.read(0xFF00), joyp_before);
+    }
+
+    #[test]
+    fn test_vram_round_trip_scaffolding() {
+        let mut bus = Bus::new();
+
+        bus.write(0x8000, 0x11);
+        bus.write(0x9FFF, 0x22);
+
+        assert_eq!(bus.read(0x8000), 0x11);
+        assert_eq!(bus.read(0x9FFF), 0x22);
+    }
+
+    #[test]
+    fn test_wram_round_trip_scaffolding() {
+        let mut bus = Bus::new();
+
+        bus.write(0xC000, 0x33);
+        bus.write(0xDFFF, 0x44);
+
+        assert_eq!(bus.read(0xC000), 0x33);
+        assert_eq!(bus.read(0xDFFF), 0x44);
+    }
+
+    #[test]
+    fn test_oam_round_trip_scaffolding() {
+        let mut bus = Bus::new();
+
+        bus.write(0xFE00, 0x55);
+        bus.write(0xFE9F, 0x66);
+
+        assert_eq!(bus.read(0xFE00), 0x55);
+        assert_eq!(bus.read(0xFE9F), 0x66);
+    }
+
+    #[test]
+    fn test_hram_round_trip_scaffolding() {
+        let mut bus = Bus::new();
+
+        bus.write(0xFF80, 0x77);
+        bus.write(0xFFFE, 0x88);
+
+        assert_eq!(bus.read(0xFF80), 0x77);
+        assert_eq!(bus.read(0xFFFE), 0x88);
+    }
+
+    #[test]
+    fn test_serial_and_lcd_register_round_trip_scaffolding() {
+        let mut bus = Bus::new();
+
+        // LY (0xFF44) intentionally excluded; future PPU timing should own its semantics.
+        let writes = [
+            (0xFF01, 0xA1),
+            (0xFF02, 0x81),
+            (0xFF40, 0x91),
+            (0xFF41, 0x85),
+            (0xFF42, 0x12),
+            (0xFF43, 0x34),
+            (0xFF45, 0x78),
+            (0xFF4A, 0x9A),
+            (0xFF4B, 0xBC),
+        ];
+
+        for (address, value) in writes {
+            bus.write(address, value);
+            assert_eq!(bus.read(address), value);
+        }
     }
 
     #[test]
