@@ -3,6 +3,7 @@ use crate::bus::Bus;
 mod alu;
 mod cb;
 mod control;
+mod interrupts;
 mod load;
 mod registers;
 #[cfg(test)]
@@ -13,6 +14,10 @@ pub use registers::Registers;
 #[derive(Debug, Default)]
 pub struct Cpu {
     pub registers: Registers,
+    ime: bool,
+    ei_delay: u8,
+    halted: bool,
+    halt_bug: bool,
 }
 
 /// 3-bit register encoding used in opcode fields.
@@ -50,12 +55,20 @@ impl Cpu {
     pub fn new() -> Self {
         Cpu {
             registers: Registers::new(),
+            ime: false,
+            ei_delay: 0,
+            halted: false,
+            halt_bug: false,
         }
     }
 
     /// Reset the CPU to initial state
     pub fn reset(&mut self) {
         self.registers = Registers::new();
+        self.ime = false;
+        self.ei_delay = 0;
+        self.halted = false;
+        self.halt_bug = false;
         // Game Boy starts execution at 0x0100
         self.registers.pc = 0x0100;
         // Initial stack pointer
@@ -64,9 +77,40 @@ impl Cpu {
 
     /// Execute one instruction and return the cycle count
     pub fn step(&mut self, bus: &mut Bus) -> u8 {
+        let pending = bus.pending_interrupts();
+
+        let cycles = if self.halted {
+            if pending == 0 {
+                4
+            } else {
+                self.halted = false;
+
+                if self.ime {
+                    self.service_interrupt(bus, pending)
+                } else {
+                    self.execute_next_instruction(bus)
+                }
+            }
+        } else if self.ime && pending != 0 {
+            self.service_interrupt(bus, pending)
+        } else {
+            self.execute_next_instruction(bus)
+        };
+
+        bus.tick_timers(cycles);
+        cycles
+    }
+
+    fn execute_next_instruction(&mut self, bus: &mut Bus) -> u8 {
         let opcode = bus.read(self.registers.pc);
-        self.registers.pc = self.registers.pc.wrapping_add(1);
-        self.execute(opcode, bus)
+        if self.halt_bug {
+            self.halt_bug = false;
+        } else {
+            self.registers.pc = self.registers.pc.wrapping_add(1);
+        }
+        let cycles = self.execute(opcode, bus);
+        self.apply_ei_delay_after_instruction();
+        cycles
     }
 
     /// Decode and execute a single opcode.
@@ -83,7 +127,17 @@ impl Cpu {
     #[allow(clippy::too_many_lines)]
     fn execute(&mut self, opcode: u8, bus: &mut Bus) -> u8 {
         match opcode {
-            0x00 | 0xF3 | 0xFB => 4, // NOP, DI, EI
+            0x00 => 4, // NOP
+
+            0xF3 => {
+                self.di();
+                4
+            }
+
+            0xFB => {
+                self.ei();
+                4
+            }
 
             0x03 | 0x13 | 0x23 | 0x33 => {
                 // INC rr
@@ -190,7 +244,10 @@ impl Cpu {
                 4
             }
 
-            0x76 => panic!("Unimplemented opcode: 0x76"), // HALT
+            0x76 => {
+                self.halt(bus);
+                4
+            }
 
             0x40..=0x7F => self.ld_r_r(opcode, bus),
 

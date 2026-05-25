@@ -2042,3 +2042,349 @@ fn test_cb_hl_indirect() {
     cpu.step(&mut bus);
     assert!(!cpu.registers.zero()); // bit 3 is set
 }
+
+#[test]
+fn test_di_disables_ime_immediately() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.ime = true;
+    cpu.ei_delay = 1;
+    bus.write(0x0000, 0xF3); // DI
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.ime);
+    assert_eq!(cpu.ei_delay, 0);
+    assert_eq!(cpu.registers.pc, 0x0001);
+}
+
+#[test]
+fn test_ei_enables_ime_after_next_instruction() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0xFB); // EI
+    bus.write(0x0001, 0x00); // NOP
+
+    cpu.step(&mut bus);
+    assert!(!cpu.ime);
+    assert_eq!(cpu.ei_delay, 1);
+
+    cpu.step(&mut bus);
+    assert!(cpu.ime);
+    assert_eq!(cpu.ei_delay, 0);
+}
+
+#[test]
+fn test_reti_sets_ime_and_returns() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFC;
+    cpu.ime = false;
+    cpu.ei_delay = 1;
+    bus.write(0xFFFC, 0x34);
+    bus.write(0xFFFD, 0x12);
+    bus.write(0x0000, 0xD9); // RETI
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 16);
+    assert_eq!(cpu.registers.pc, 0x1234);
+    assert_eq!(cpu.registers.sp, 0xFFFE);
+    assert!(cpu.ime);
+    assert_eq!(cpu.ei_delay, 0);
+}
+
+#[test]
+fn test_interrupt_service_when_ime_enabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.pc = 0x1234;
+    cpu.registers.sp = 0xFFFE;
+    cpu.ime = true;
+
+    // VBlank (bit 0) and Timer (bit 2) pending; VBlank should win.
+    bus.write(0xFFFF, 0b0000_0101); // IE
+    bus.write(0xFF0F, 0b0000_0101); // IF
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 20);
+    assert_eq!(cpu.registers.pc, 0x0040);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x12);
+    assert_eq!(bus.read(0xFFFC), 0x34);
+    assert_eq!(bus.read(0xFF0F), 0b0000_0100); // serviced bit cleared
+    assert!(!cpu.ime);
+    assert!(!cpu.halted);
+}
+
+#[test]
+fn test_halt_idles_without_pending_interrupt() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x76); // HALT
+
+    let first_cycles = cpu.step(&mut bus);
+    assert_eq!(first_cycles, 4);
+    assert!(cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0001);
+
+    let second_cycles = cpu.step(&mut bus);
+    assert_eq!(second_cycles, 4);
+    assert!(cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0001);
+}
+
+#[test]
+fn test_halt_resumes_and_services_interrupt_when_ime_enabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0x76); // HALT
+
+    cpu.step(&mut bus);
+    assert!(cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0001);
+
+    cpu.ime = true;
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 20);
+    assert!(!cpu.halted);
+    assert!(!cpu.ime);
+    assert_eq!(cpu.registers.pc, 0x0040);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x00);
+    assert_eq!(bus.read(0xFFFC), 0x01);
+}
+
+#[test]
+fn test_halt_resumes_without_servicing_when_ime_disabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x76); // HALT
+    bus.write(0x0001, 0x00); // NOP
+
+    cpu.step(&mut bus);
+    assert!(cpu.halted);
+
+    // Pending interrupt should wake HALT even with IME=0.
+    bus.write(0xFFFF, 0b0000_0001);
+    bus.write(0xFF0F, 0b0000_0001);
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0002); // Executed NOP at 0x0001
+    assert_eq!(bus.read(0xFF0F), 0b0000_0001); // Not serviced
+}
+
+#[test]
+fn test_halt_bug_when_ime_disabled_and_interrupt_pending() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x76); // HALT
+    bus.write(0x0001, 0x04); // INC B
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.halted);
+    assert!(cpu.halt_bug);
+    assert_eq!(cpu.registers.pc, 0x0001);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.halt_bug);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0001); // PC did not advance for this fetch
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert_eq!(cpu.registers.b, 2);
+    assert_eq!(cpu.registers.pc, 0x0002);
+}
+
+#[test]
+fn test_ei_with_pending_interrupt_services_after_following_instruction() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0xFB); // EI
+    bus.write(0x0001, 0x00); // NOP
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.ime);
+    assert_eq!(cpu.registers.pc, 0x0001);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.ime);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 20);
+    assert_eq!(cpu.registers.pc, 0x0040);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x00);
+    assert_eq!(bus.read(0xFFFC), 0x02);
+    assert_eq!(bus.read(0xFF0F), 0);
+}
+
+#[test]
+fn test_reti_then_pending_interrupt_services_on_next_step() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFC;
+    bus.write(0x0000, 0xD9); // RETI
+    bus.write(0xFFFC, 0x34);
+    bus.write(0xFFFD, 0x12);
+    bus.write(0xFFFF, 0b0000_0100); // IE Timer
+    bus.write(0xFF0F, 0b0000_0100); // IF Timer
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 16);
+    assert_eq!(cpu.registers.pc, 0x1234);
+    assert_eq!(cpu.registers.sp, 0xFFFE);
+    assert!(cpu.ime);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 20);
+    assert_eq!(cpu.registers.pc, 0x0050);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x12);
+    assert_eq!(bus.read(0xFFFC), 0x34);
+    assert_eq!(bus.read(0xFF0F), 0);
+}
+
+#[test]
+fn test_halt_not_entered_when_interrupt_pending_and_ime_enabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFE;
+    cpu.ime = true;
+    bus.write(0x0000, 0x76); // HALT, should not execute due pre-service
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 20);
+    assert!(!cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0040);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x00);
+    assert_eq!(bus.read(0xFFFC), 0x00);
+}
+
+#[test]
+fn test_div_increments_every_256_cycles() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+
+    for _ in 0..63 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(bus.read(0xFF04), 0);
+
+    cpu.step(&mut bus);
+    assert_eq!(bus.read(0xFF04), 1);
+}
+
+#[test]
+fn test_div_write_resets_divider_phase() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+
+    for _ in 0..64 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(bus.read(0xFF04), 1);
+
+    bus.write(0xFF04, 0xAB);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read(0xFF04), 0);
+
+    for _ in 0..63 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(bus.read(0xFF04), 1);
+}
+
+#[test]
+fn test_tima_does_not_increment_when_disabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0xFF05, 0x10); // TIMA
+    bus.write(0xFF07, 0x00); // TAC: disabled
+
+    for _ in 0..100 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read(0xFF05), 0x10);
+    assert_eq!(bus.read(0xFF0F) & 0b0000_0100, 0);
+}
+
+#[test]
+fn test_tima_frequency_16_cycles() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0xFF05, 0x00); // TIMA
+    bus.write(0xFF07, 0b0000_0101); // TAC: enable, 16-cycle period
+
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read(0xFF05), 1);
+}
+
+#[test]
+fn test_tima_overflow_reloads_tma_and_sets_interrupt_flag() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0xFF05, 0xFF); // TIMA
+    bus.write(0xFF06, 0x42); // TMA
+    bus.write(0xFF0F, 0b0001_0000); // existing IF bit
+    bus.write(0xFF07, 0b0000_0101); // TAC: enable, 16-cycle period
+
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read(0xFF05), 0x42);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0100);
+}
+
+#[test]
+fn test_tac_change_resets_timer_phase() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0xFF05, 0x00); // TIMA
+    bus.write(0xFF07, 0b0000_0101); // enable, 16-cycle period
+
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(bus.read(0xFF05), 0x00);
+
+    bus.write(0xFF07, 0b0000_0110); // enable, 64-cycle period
+
+    for _ in 0..15 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(bus.read(0xFF05), 0x00);
+
+    cpu.step(&mut bus);
+    assert_eq!(bus.read(0xFF05), 0x01);
+}

@@ -82,8 +82,9 @@ impl Cpu {
     }
 
     pub(in crate::cpu) fn reti(&mut self, bus: &Bus) {
-        // RETI (treated as RET for now; interrupt enable pending)
         self.registers.pc = self.pop16(bus);
+        self.ime = true;
+        self.ei_delay = 0;
     }
 
     pub(in crate::cpu) fn rst(&mut self, opcode: u8, bus: &mut Bus) {
