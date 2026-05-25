@@ -22,6 +22,236 @@ fn test_cpu_reset() {
 }
 
 #[test]
+fn test_condition_decode_mapping() {
+    assert_eq!(Condition::from_u2(0), Condition::Nz);
+    assert_eq!(Condition::from_u2(1), Condition::Z);
+    assert_eq!(Condition::from_u2(2), Condition::Nc);
+    assert_eq!(Condition::from_u2(3), Condition::C);
+    assert_eq!(Condition::from_u2(0b1111_1100), Condition::Nz);
+}
+
+#[test]
+fn test_reg_pair_decode_mapping() {
+    assert_eq!(RegPair::from_u2(0), RegPair::Bc);
+    assert_eq!(RegPair::from_u2(1), RegPair::De);
+    assert_eq!(RegPair::from_u2(2), RegPair::Hl);
+    assert_eq!(RegPair::from_u2(3), RegPair::Sp);
+    assert_eq!(RegPair::from_u2(0b1111_1101), RegPair::De);
+}
+
+#[test]
+fn test_stack_pair_decode_mapping() {
+    assert_eq!(StackPair::from_u2(0), StackPair::Bc);
+    assert_eq!(StackPair::from_u2(1), StackPair::De);
+    assert_eq!(StackPair::from_u2(2), StackPair::Hl);
+    assert_eq!(StackPair::from_u2(3), StackPair::Af);
+    assert_eq!(StackPair::from_u2(0b1111_1110), StackPair::Hl);
+}
+
+#[test]
+fn test_dispatch_boundary_ld_block_vs_halt_0x70_0x76_0x77() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.set_hl(0xC000);
+    cpu.registers.b = 0x44;
+    cpu.registers.a = 0x99;
+    bus.write(0x0000, 0x70); // LD (HL), B
+    bus.write(0x0001, 0x76); // HALT
+    bus.write(0x0002, 0x77); // LD (HL), A
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 8);
+    assert_eq!(bus.read(0xC000), 0x44);
+    assert!(!cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0001);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    // Wake HALT without servicing (IME=0) and execute the boundary opcode.
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 8);
+    assert!(!cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(bus.read(0xC000), 0x99);
+}
+
+#[test]
+fn test_dispatch_boundary_alu_vs_control_0xbf_0xc0() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.a = 0x42;
+    cpu.registers.sp = 0xFFFC;
+    bus.write(0xFFFC, 0xAA);
+    bus.write(0xFFFD, 0xBB);
+    bus.write(0x0000, 0xBF); // CP A, A
+    bus.write(0x0001, 0xC0); // RET NZ
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert_eq!(cpu.registers.pc, 0x0001);
+    assert_eq!(cpu.registers.a, 0x42);
+    assert!(cpu.registers.zero());
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 8); // RET NZ not taken (Z=1)
+    assert_eq!(cpu.registers.pc, 0x0002);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+}
+
+#[test]
+fn test_cb_prefix_consumes_second_byte_pc_and_cycles() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.b = 0b1000_0000;
+    cpu.registers.set_hl(0xC000);
+    bus.write(0xC000, 0b0000_0001);
+    bus.write(0x0000, 0xCB);
+    bus.write(0x0001, 0x00); // RLC B
+    bus.write(0x0002, 0xCB);
+    bus.write(0x0003, 0x46); // BIT 0, (HL)
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 8);
+    assert_eq!(cpu.registers.pc, 0x0002);
+    assert_eq!(cpu.registers.b, 0b0000_0001);
+    assert!(cpu.registers.carry());
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 12);
+    assert_eq!(cpu.registers.pc, 0x0004);
+    assert!(!cpu.registers.zero());
+}
+
+#[test]
+fn test_call_nc_and_call_c_decode_routing() {
+    // CALL NC taken
+    {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.sp = 0xFFFE;
+        cpu.registers.set_carry(false);
+        bus.write(0x0000, 0xD4); // CALL NC, nn
+        bus.write(0x0001, 0x34);
+        bus.write(0x0002, 0x12);
+
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 24);
+        assert_eq!(cpu.registers.pc, 0x1234);
+        assert_eq!(cpu.registers.sp, 0xFFFC);
+        assert_eq!(bus.read(0xFFFD), 0x00);
+        assert_eq!(bus.read(0xFFFC), 0x03);
+    }
+
+    // CALL NC not taken
+    {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.sp = 0xFFFE;
+        cpu.registers.set_carry(true);
+        bus.write(0x0000, 0xD4); // CALL NC, nn
+        bus.write(0x0001, 0x34);
+        bus.write(0x0002, 0x12);
+
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.registers.pc, 0x0003);
+        assert_eq!(cpu.registers.sp, 0xFFFE);
+    }
+
+    // CALL C taken
+    {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.sp = 0xFFFE;
+        cpu.registers.set_carry(true);
+        bus.write(0x0000, 0xDC); // CALL C, nn
+        bus.write(0x0001, 0x78);
+        bus.write(0x0002, 0x56);
+
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 24);
+        assert_eq!(cpu.registers.pc, 0x5678);
+        assert_eq!(cpu.registers.sp, 0xFFFC);
+        assert_eq!(bus.read(0xFFFD), 0x00);
+        assert_eq!(bus.read(0xFFFC), 0x03);
+    }
+
+    // CALL C not taken
+    {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.registers.sp = 0xFFFE;
+        cpu.registers.set_carry(false);
+        bus.write(0x0000, 0xDC); // CALL C, nn
+        bus.write(0x0001, 0x78);
+        bus.write(0x0002, 0x56);
+
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.registers.pc, 0x0003);
+        assert_eq!(cpu.registers.sp, 0xFFFE);
+    }
+}
+
+#[test]
+fn test_jr_nc_not_taken_timing_and_pc() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.set_carry(true);
+    bus.write(0x0000, 0x30); // JR NC, e
+    bus.write(0x0001, 0x04);
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 8);
+    assert_eq!(cpu.registers.pc, 0x0002);
+}
+
+#[test]
+fn test_push_pop_de_hl_stackpair_decode() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFE;
+    cpu.registers.set_de(0x1234);
+    cpu.registers.set_hl(0xBEEF);
+    bus.write(0x0000, 0xD5); // PUSH DE
+    bus.write(0x0001, 0xE5); // PUSH HL
+    bus.write(0x0002, 0xE1); // POP HL
+    bus.write(0x0003, 0xD1); // POP DE
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 16);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x12);
+    assert_eq!(bus.read(0xFFFC), 0x34);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 16);
+    assert_eq!(cpu.registers.sp, 0xFFFA);
+    assert_eq!(bus.read(0xFFFB), 0xBE);
+    assert_eq!(bus.read(0xFFFA), 0xEF);
+
+    cpu.registers.set_de(0x0000);
+    cpu.registers.set_hl(0x0000);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 12);
+    assert_eq!(cpu.registers.hl(), 0xBEEF);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 12);
+    assert_eq!(cpu.registers.de(), 0x1234);
+    assert_eq!(cpu.registers.sp, 0xFFFE);
+}
+
+#[test]
 fn test_nop() {
     let mut cpu = Cpu::new();
     let mut bus = Bus::new();

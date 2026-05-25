@@ -1,18 +1,23 @@
+//! Interrupt-control, HALT behavior, and interrupt dispatch helpers.
+
 use crate::bus::Bus;
 
 use super::Cpu;
 
 impl Cpu {
+    /// Execute `DI` (`0xF3`): disable interrupts immediately.
     pub(in crate::cpu) fn di(&mut self) {
         self.ime = false;
         self.ei_delay = 0;
     }
 
+    /// Execute `EI` (`0xFB`): schedule IME enable after next instruction.
     pub(in crate::cpu) fn ei(&mut self) {
         // EI enables IME after the *next* instruction.
         self.ei_delay = 2;
     }
 
+    /// Execute `HALT` (`0x76`) and model HALT-bug entry conditions.
     pub(in crate::cpu) fn halt(&mut self, bus: &Bus) {
         let pending = bus.pending_interrupts();
         if !self.ime && pending != 0 {
@@ -24,6 +29,7 @@ impl Cpu {
         }
     }
 
+    /// Apply delayed EI completion after each retired instruction.
     pub(in crate::cpu) fn apply_ei_delay_after_instruction(&mut self) {
         if self.ei_delay > 0 {
             self.ei_delay -= 1;
@@ -33,6 +39,13 @@ impl Cpu {
         }
     }
 
+    /// Service the highest-priority pending interrupt.
+    ///
+    /// Side effects:
+    /// - Clears the acknowledged IF bit.
+    /// - Disables IME and clears transient low-power/bug states.
+    /// - Pushes current `PC` and jumps to vector.
+    /// - Returns fixed 20-cycle ISR entry cost.
     pub(in crate::cpu) fn service_interrupt(&mut self, bus: &mut Bus, pending: u8) -> u8 {
         let index = highest_priority_interrupt_index(pending);
         let mask = 1u8 << index;

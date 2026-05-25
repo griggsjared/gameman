@@ -1,8 +1,17 @@
+//! Arithmetic, logic, and flag-manipulation helpers.
+
 use crate::bus::Bus;
 
-use super::{Cpu, Reg};
+use super::{Cpu, Reg, RegPair};
 
 impl Cpu {
+    /// Execute accumulator-only rotates:
+    /// - `RLCA` (`0x07`)
+    /// - `RRCA` (`0x0F`)
+    /// - `RLA` (`0x17`)
+    /// - `RRA` (`0x1F`)
+    ///
+    /// These forms always clear `Z` on DMG.
     pub(in crate::cpu) fn rotate_accumulator(&mut self, opcode: u8) {
         match opcode {
             0x07 => {
@@ -51,6 +60,7 @@ impl Cpu {
         }
     }
 
+    /// Execute `DAA` (`0x27`) for BCD correction after add/subtract.
     pub(in crate::cpu) fn daa(&mut self) {
         let mut a = self.registers.a;
         let mut carry = self.registers.carry();
@@ -83,24 +93,30 @@ impl Cpu {
         self.registers.set_carry(carry);
     }
 
+    /// Execute `CPL` (`0x2F`): bitwise invert `A`, set `N` and `H`.
     pub(in crate::cpu) fn cpl(&mut self) {
         self.registers.a = !self.registers.a;
         self.registers.set_subtract(true);
         self.registers.set_half_carry(true);
     }
 
+    /// Execute `SCF` (`0x37`): set carry flag and clear `N/H`.
     pub(in crate::cpu) fn scf(&mut self) {
         self.registers.set_subtract(false);
         self.registers.set_half_carry(false);
         self.registers.set_carry(true);
     }
 
+    /// Execute `CCF` (`0x3F`): complement carry flag and clear `N/H`.
     pub(in crate::cpu) fn ccf(&mut self) {
         self.registers.set_subtract(false);
         self.registers.set_half_carry(false);
         self.registers.set_carry(!self.registers.carry());
     }
 
+    /// Execute grouped `ALU A, r` operations (`0x80..=0xBF`).
+    ///
+    /// Decodes one of: `ADD/ADC/SUB/SBC/AND/XOR/OR/CP` based on opcode bits.
     pub(in crate::cpu) fn alu_a_r(&mut self, opcode: u8, bus: &Bus) -> u8 {
         // ALU A, r — ADD, ADC, SUB, SBC, AND, XOR, OR, CP
         let op = (opcode >> 3) & 0b111;
@@ -124,9 +140,12 @@ impl Cpu {
         }
     }
 
+    /// Execute `ADD SP, e` (`0xE8`).
+    ///
+    /// Flags: `Z=0`, `N=0`, `H/C` from low-byte signed-add carry behavior.
     pub(in crate::cpu) fn add_sp_e(&mut self, bus: &Bus) {
         #[allow(clippy::cast_possible_wrap)]
-        let offset = self.imm8(bus).cast_signed();
+        let offset = self.read_immediate_u8(bus).cast_signed();
         let sp = self.registers.sp;
         #[allow(clippy::cast_sign_loss)]
         let result = sp.wrapping_add(offset as u16);
@@ -141,6 +160,7 @@ impl Cpu {
             .set_carry((sp & 0xFF) + (offset as u16 & 0xFF) > 0xFF);
     }
 
+    /// Execute `ADD A, value` shared implementation.
     pub(in crate::cpu) fn add_a(&mut self, value: u8) {
         let a = self.registers.a;
         let (result, carry) = a.overflowing_add(value);
@@ -152,19 +172,28 @@ impl Cpu {
         self.registers.set_carry(carry);
     }
 
-    pub(in crate::cpu) fn inc_rr(&mut self, pair: u8) {
-        let value = self.read_rr(pair);
-        self.write_rr(pair, value.wrapping_add(1));
+    /// Execute `INC rr` (`0x03/0x13/0x23/0x33`).
+    ///
+    /// Flags are unaffected.
+    pub(in crate::cpu) fn inc_rr(&mut self, pair: RegPair) {
+        let value = self.read_reg_pair(pair);
+        self.write_reg_pair(pair, value.wrapping_add(1));
     }
 
-    pub(in crate::cpu) fn dec_rr(&mut self, pair: u8) {
-        let value = self.read_rr(pair);
-        self.write_rr(pair, value.wrapping_sub(1));
+    /// Execute `DEC rr` (`0x0B/0x1B/0x2B/0x3B`).
+    ///
+    /// Flags are unaffected.
+    pub(in crate::cpu) fn dec_rr(&mut self, pair: RegPair) {
+        let value = self.read_reg_pair(pair);
+        self.write_reg_pair(pair, value.wrapping_sub(1));
     }
 
-    pub(in crate::cpu) fn add_hl_rr(&mut self, pair: u8) {
+    /// Execute `ADD HL, rr` (`0x09/0x19/0x29/0x39`).
+    ///
+    /// Updates `N/H/C`; `Z` is preserved.
+    pub(in crate::cpu) fn add_hl_rr(&mut self, pair: RegPair) {
         let hl = self.registers.hl();
-        let value = self.read_rr(pair);
+        let value = self.read_reg_pair(pair);
         let result = hl.wrapping_add(value);
         self.registers.set_hl(result);
         self.registers.set_subtract(false);
@@ -173,6 +202,7 @@ impl Cpu {
         self.registers.set_carry(hl > 0xFFFF - value);
     }
 
+    /// Execute `ADC A, value` shared implementation.
     pub(in crate::cpu) fn adc_a(&mut self, value: u8) {
         let a = self.registers.a;
         let carry = u8::from(self.registers.carry());
@@ -186,6 +216,7 @@ impl Cpu {
             .set_carry(u16::from(a) + u16::from(value) + u16::from(carry) > 0xFF);
     }
 
+    /// Execute `SUB A, value` shared implementation.
     pub(in crate::cpu) fn sub_a(&mut self, value: u8) {
         let a = self.registers.a;
         let result = a.wrapping_sub(value);
@@ -196,6 +227,7 @@ impl Cpu {
         self.registers.set_carry(a < value);
     }
 
+    /// Execute `SBC A, value` shared implementation.
     pub(in crate::cpu) fn sbc_a(&mut self, value: u8) {
         let a = self.registers.a;
         let carry = u8::from(self.registers.carry());
@@ -209,6 +241,7 @@ impl Cpu {
             .set_carry(u16::from(a) < u16::from(value) + u16::from(carry));
     }
 
+    /// Execute `AND A, value` shared implementation.
     pub(in crate::cpu) fn and_a(&mut self, value: u8) {
         let result = self.registers.a & value;
         self.registers.a = result;
@@ -218,6 +251,7 @@ impl Cpu {
         self.registers.set_carry(false);
     }
 
+    /// Execute `XOR A, value` shared implementation.
     pub(in crate::cpu) fn xor_a(&mut self, value: u8) {
         let result = self.registers.a ^ value;
         self.registers.a = result;
@@ -227,6 +261,7 @@ impl Cpu {
         self.registers.set_carry(false);
     }
 
+    /// Execute `OR A, value` shared implementation.
     pub(in crate::cpu) fn or_a(&mut self, value: u8) {
         let result = self.registers.a | value;
         self.registers.a = result;
@@ -236,6 +271,7 @@ impl Cpu {
         self.registers.set_carry(false);
     }
 
+    /// Execute `CP A, value` shared implementation (compare without storing).
     pub(in crate::cpu) fn cp_a(&mut self, value: u8) {
         let a = self.registers.a;
         let result = a.wrapping_sub(value);

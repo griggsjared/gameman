@@ -1,8 +1,20 @@
+//! `0xCB`-prefixed bit-manipulation instruction helpers.
+
 use crate::bus::Bus;
 
 use super::{Cpu, Reg};
 
 impl Cpu {
+    /// Execute one `0xCB`-prefixed opcode.
+    ///
+    /// Opcode classes:
+    /// - `0x00..=0x3F`: rotate/shift/swap
+    /// - `0x40..=0x7F`: `BIT n, r`
+    /// - `0x80..=0xBF`: `RES n, r`
+    /// - `0xC0..=0xFF`: `SET n, r`
+    ///
+    /// Returns 8 cycles for register targets, and 16 cycles for `(HL)` writes.
+    /// For `BIT n, (HL)`, returns 12 cycles (read-only operation).
     pub(in crate::cpu) fn execute_cb(&mut self, opcode: u8, bus: &mut Bus) -> u8 {
         let reg = Reg::from_u3(opcode);
         let is_hl = matches!(reg, Reg::IndirectHl);
