@@ -12,8 +12,12 @@ pub struct Bus {
     div_value: u8,
     tima_cycles: u16,
     last_tac: u8,
+    joyp_select: u8,
+    joyp_direction_pressed: u8,
+    joyp_button_pressed: u8,
 }
 
+const JOYP_ADDR: u16 = 0xFF00;
 const DIV_ADDR: u16 = 0xFF04;
 const TIMA_ADDR: u16 = 0xFF05;
 const TMA_ADDR: u16 = 0xFF06;
@@ -23,6 +27,11 @@ const IE_ADDR: u16 = 0xFFFF;
 const INTERRUPT_MASK: u8 = 0x1F;
 const JOYPAD_INTERRUPT_BIT: u8 = 0b0001_0000;
 const TIMER_INTERRUPT_BIT: u8 = 0b0000_0100;
+const JOYP_SELECT_MASK: u8 = 0b0011_0000;
+const JOYP_LOW_MASK: u8 = 0b0000_1111;
+const JOYP_UNUSED_MASK: u8 = 0b1100_0000;
+const JOYP_SELECT_DIRECTIONS: u8 = 0b0001_0000;
+const JOYP_SELECT_BUTTONS: u8 = 0b0010_0000;
 
 impl Default for Bus {
     fn default() -> Self {
@@ -41,18 +50,30 @@ impl Bus {
             div_value: 0,
             tima_cycles: 0,
             last_tac: 0,
+            joyp_select: JOYP_SELECT_MASK,
+            joyp_direction_pressed: 0,
+            joyp_button_pressed: 0,
         }
     }
 
     /// Read a byte from the 64KB address space.
     #[must_use]
     pub fn read(&self, address: u16) -> u8 {
-        self.memory[usize::from(address)]
+        match address {
+            JOYP_ADDR => self.joyp_value(),
+            _ => self.memory[usize::from(address)],
+        }
     }
 
     /// Write a byte into the 64KB address space.
     pub fn write(&mut self, address: u16, value: u8) {
         match address {
+            JOYP_ADDR => {
+                let previous_low = self.joyp_low_nibble();
+                self.joyp_select = value & JOYP_SELECT_MASK;
+                let current_low = self.joyp_low_nibble();
+                self.request_joypad_interrupt_on_falling_edge(previous_low, current_low);
+            }
             DIV_ADDR => {
                 // Writing any value to DIV resets it to 0.
                 self.div_cycles = 0;
@@ -71,6 +92,19 @@ impl Bus {
                 self.memory[usize::from(address)] = value;
             }
         }
+    }
+
+    /// Update both joypad rows atomically.
+    ///
+    /// Bit mapping for each mask is:
+    /// bit0 = Right / A, bit1 = Left / B, bit2 = Up / Select, bit3 = Down / Start.
+    /// In both masks, bit 1 means pressed.
+    pub fn set_joypad_pressed(&mut self, direction_pressed_mask: u8, button_pressed_mask: u8) {
+        let previous_low = self.joyp_low_nibble();
+        self.joyp_direction_pressed = direction_pressed_mask & JOYP_LOW_MASK;
+        self.joyp_button_pressed = button_pressed_mask & JOYP_LOW_MASK;
+        let current_low = self.joyp_low_nibble();
+        self.request_joypad_interrupt_on_falling_edge(previous_low, current_low);
     }
 
     /// Tick timer registers by instruction cycles.
@@ -130,6 +164,29 @@ impl Bus {
         let iflags = self.read(IF_ADDR);
         self.memory[usize::from(IF_ADDR)] = iflags | (mask & INTERRUPT_MASK);
     }
+
+    #[must_use]
+    fn joyp_value(&self) -> u8 {
+        JOYP_UNUSED_MASK | self.joyp_select | self.joyp_low_nibble()
+    }
+
+    #[must_use]
+    fn joyp_low_nibble(&self) -> u8 {
+        let mut low = JOYP_LOW_MASK;
+        if self.joyp_select & JOYP_SELECT_DIRECTIONS == 0 {
+            low &= !self.joyp_direction_pressed & JOYP_LOW_MASK;
+        }
+        if self.joyp_select & JOYP_SELECT_BUTTONS == 0 {
+            low &= !self.joyp_button_pressed & JOYP_LOW_MASK;
+        }
+        low
+    }
+
+    fn request_joypad_interrupt_on_falling_edge(&mut self, previous_low: u8, current_low: u8) {
+        if previous_low & !current_low != 0 {
+            self.request_interrupt(JOYPAD_INTERRUPT_BIT);
+        }
+    }
 }
 
 const fn timer_period(tac: u8) -> u16 {
@@ -161,6 +218,12 @@ mod tests {
     }
 
     #[test]
+    fn test_joyp_default_value() {
+        let bus = Bus::new();
+        assert_eq!(bus.read(0xFF00), 0xFF);
+    }
+
+    #[test]
     fn test_requested_interrupts_masks_upper_bits() {
         let mut bus = Bus::new();
         bus.write(0xFF0F, 0b1110_0101);
@@ -176,6 +239,169 @@ mod tests {
         assert!(bus.joypad_interrupt_requested());
 
         bus.write(0xFF0F, 0b0000_0100);
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joyp_read_reflects_selected_direction_keys() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.set_joypad_pressed(0b0101, 0b0011); // Right + Up; buttons ignored while unselected
+
+        assert_eq!(bus.read(0xFF00), 0b1110_1010);
+    }
+
+    #[test]
+    fn test_joyp_read_reflects_selected_button_keys() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0001_0000); // Select buttons (P15)
+        bus.set_joypad_pressed(0b0011, 0b1010); // B + Start; directions ignored while unselected
+
+        assert_eq!(bus.read(0xFF00), 0b1101_0101);
+    }
+
+    #[test]
+    fn test_joyp_read_reflects_both_selected_rows() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0000_0000); // Select both rows
+        bus.set_joypad_pressed(0b0001, 0b0100); // Right + Select
+
+        assert_eq!(bus.read(0xFF00), 0b1100_1010);
+    }
+
+    #[test]
+    fn test_joyp_write_ignores_low_nibble_and_forces_upper_bits() {
+        let mut bus = Bus::new();
+
+        bus.write(0xFF00, 0b1010_0110);
+        assert_eq!(bus.read(0xFF00), 0b1110_1111);
+
+        bus.set_joypad_pressed(0b0001, 0);
+        assert_eq!(bus.read(0xFF00), 0b1110_1110);
+    }
+
+    #[test]
+    fn test_joyp_low_nibble_write_does_not_request_interrupt_without_select_change() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.set_joypad_pressed(0b0001, 0); // Right pressed
+        bus.write(0xFF0F, 0);
+
+        bus.write(0xFF00, 0b0010_1111); // Same select bits, low nibble ignored
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_requested_on_selected_press_edge() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.write(0xFF0F, 0);
+
+        bus.set_joypad_pressed(0b0001, 0); // Right pressed
+
+        assert!(bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_not_requested_on_release() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+
+        bus.set_joypad_pressed(0b0001, 0);
+        assert!(bus.joypad_interrupt_requested());
+
+        bus.write(0xFF0F, 0);
+        bus.set_joypad_pressed(0, 0);
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_not_re_requested_for_idempotent_state() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.write(0xFF0F, 0);
+
+        bus.set_joypad_pressed(0b0001, 0);
+        assert!(bus.joypad_interrupt_requested());
+
+        bus.write(0xFF0F, 0);
+        bus.set_joypad_pressed(0b0001, 0);
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_set_joypad_pressed_atomic_swap_does_not_create_false_edge() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0000_0000); // Select both rows
+        bus.set_joypad_pressed(0b0001, 0); // Right pressed in directions row
+        bus.write(0xFF0F, 0);
+
+        bus.set_joypad_pressed(0, 0b0001); // Same logical line stays low via buttons row
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_not_requested_for_unselected_row_press() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0001_0000); // Select buttons (P15)
+        bus.write(0xFF0F, 0);
+
+        bus.set_joypad_pressed(0b0001, 0); // Right pressed on unselected row
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_requested_on_select_change_falling_edge() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0011_0000); // No row selected
+        bus.write(0xFF0F, 0);
+
+        bus.set_joypad_pressed(0b0001, 0); // Right pressed while unselected
+        assert!(!bus.joypad_interrupt_requested());
+
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+
+        assert!(bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_not_requested_on_select_change_rising_edge() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.set_joypad_pressed(0b0001, 0); // Right pressed while selected
+        bus.write(0xFF0F, 0);
+
+        bus.write(0xFF00, 0b0011_0000); // Deselect directions -> low nibble rises
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_not_requested_when_select_switch_keeps_low_state() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.set_joypad_pressed(0b0001, 0b0001); // Matching bit low in both rows
+        bus.write(0xFF0F, 0);
+
+        bus.write(0xFF00, 0b0001_0000); // Switch to buttons (P15)
+
+        assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_joypad_interrupt_not_requested_when_select_write_unchanged() {
+        let mut bus = Bus::new();
+        bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+        bus.set_joypad_pressed(0b0001, 0);
+        bus.write(0xFF0F, 0);
+
+        bus.write(0xFF00, 0b0010_0000); // Same select value
+
         assert!(!bus.joypad_interrupt_requested());
     }
 }

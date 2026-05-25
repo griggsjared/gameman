@@ -2442,6 +2442,216 @@ fn test_stop_wakes_on_joypad_request_when_ime_disabled() {
 }
 
 #[test]
+fn test_stop_wakes_on_real_joypad_press_edge_when_ime_disabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+    bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0);
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    bus.set_joypad_pressed(0b0001, 0); // Right pressed
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+}
+
+#[test]
+fn test_stop_does_not_rewake_without_fresh_real_joypad_edge() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+    bus.write(0x0003, 0x10); // STOP
+    bus.write(0x0004, 0x00); // STOP second byte
+    bus.write(0x0005, 0x04); // INC B
+    bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0);
+    bus.set_joypad_pressed(0b0001, 0); // Right pressed edge
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0005);
+
+    bus.write(0xFF0F, 0);
+    assert_eq!(bus.read(0xFF0F), 0);
+    bus.set_joypad_pressed(0b0001, 0); // No fresh edge
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0005);
+}
+
+#[test]
+fn test_stop_wakes_after_real_joypad_release_and_repress() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+    bus.write(0x0003, 0x10); // STOP
+    bus.write(0x0004, 0x00); // STOP second byte
+    bus.write(0x0005, 0x04); // INC B
+    bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0);
+    bus.set_joypad_pressed(0b0001, 0); // Right pressed edge
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0005);
+
+    bus.write(0xFF0F, 0);
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0005);
+
+    bus.set_joypad_pressed(0, 0);
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    bus.set_joypad_pressed(0b0001, 0);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 2);
+    assert_eq!(cpu.registers.pc, 0x0006);
+}
+
+#[test]
+fn test_stop_wakes_on_select_change_after_unselected_row_press() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0);
+    bus.write(0xFF00, 0b0001_0000); // Select buttons (P15), directions unselected
+    bus.set_joypad_pressed(0b0001, 0); // Right pressed while unselected
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.b, 0);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    bus.write(0xFF00, 0b0010_0000); // Select directions (P14)
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+}
+
+#[test]
+fn test_stop_wakes_on_select_change_after_unselected_button_row_press() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0);
+    bus.write(0xFF00, 0b0010_0000); // Select directions (P14), buttons unselected
+    bus.set_joypad_pressed(0, 0b0001); // A pressed while unselected
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.b, 0);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    bus.write(0xFF00, 0b0001_0000); // Select buttons (P15)
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+}
+
+#[test]
+fn test_stop_wakes_on_real_button_row_press_edge_when_ime_disabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+    bus.write(0xFF00, 0b0001_0000); // Select buttons (P15)
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0);
+    assert_eq!(bus.read(0xFF0F), 0);
+
+    bus.set_joypad_pressed(0, 0b0001); // A pressed
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+}
+
+#[test]
 fn test_stop_does_not_wake_on_non_joypad_request() {
     let mut cpu = Cpu::new();
     let mut bus = Bus::new();
