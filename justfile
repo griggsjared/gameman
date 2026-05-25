@@ -21,8 +21,14 @@ fmt-check:
 run:
     cargo run
 
-blargg:
-    cargo test --test blargg -- --ignored
+# Download Blargg test ROMs (needed for blargg tests)
+test-roms:
+    mkdir -p test-roms
+    curl -L -o /tmp/cpu_instrs.zip \
+      https://gbdev.gg8.se/files/roms/blargg-gb-tests/cpu_instrs.zip
+    unzip -o /tmp/cpu_instrs.zip -d test-roms/
+    rm /tmp/cpu_instrs.zip
 
-blargg-verbose:
-    cargo test --test blargg -- --ignored --nocapture
+# Run Blargg CPU test ROMs (download first via `just test-roms`)
+blargg:
+    cargo test --test blargg -- --nocapture

@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::fs;
+use std::path::Path;
 
 use gameman::bus::Bus;
 use gameman::cpu::Cpu;
@@ -73,11 +74,18 @@ fn run_individual_test(rom_path: &str) -> (bool, String) {
 
 /// Run Blargg's `cpu_instrs` individual test ROMs.
 ///
-/// This test is ignored by default because it requires most CPU opcodes
-/// to be implemented. Enable with: cargo test --ignored
+/// Skips gracefully when ROMs are not present locally.
+/// In CI, ROMs are downloaded and cached by `.github/workflows/ci.yml`.
+/// Download manually: `curl -L https://gbdev.gg8.se/files/roms/blargg-gb-tests/cpu_instrs.zip | unzip`
 #[test]
-#[ignore = "CPU not yet complete enough to run Blargg tests"]
 fn test_blargg_cpu_instrs() {
+    if !Path::new("test-roms/cpu_instrs/individual").is_dir() {
+        eprintln!(
+            "Skipping: test-roms/cpu_instrs/individual/ not found. \
+             Download from https://gbdev.gg8.se/files/roms/blargg-gb-tests/"
+        );
+        return;
+    }
     let tests = [
         "01-special",
         "02-interrupts",
