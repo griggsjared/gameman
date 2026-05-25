@@ -17,6 +17,8 @@ pub struct Cpu {
     ime: bool,
     ei_delay: u8,
     halted: bool,
+    stopped: bool,
+    stop_joypad_latch: bool,
     halt_bug: bool,
 }
 
@@ -58,6 +60,8 @@ impl Cpu {
             ime: false,
             ei_delay: 0,
             halted: false,
+            stopped: false,
+            stop_joypad_latch: false,
             halt_bug: false,
         }
     }
@@ -68,6 +72,8 @@ impl Cpu {
         self.ime = false;
         self.ei_delay = 0;
         self.halted = false;
+        self.stopped = false;
+        self.stop_joypad_latch = false;
         self.halt_bug = false;
         // Game Boy starts execution at 0x0100
         self.registers.pc = 0x0100;
@@ -79,7 +85,31 @@ impl Cpu {
     pub fn step(&mut self, bus: &mut Bus) -> u8 {
         let pending = bus.pending_interrupts();
 
-        let cycles = if self.halted {
+        let joypad_requested = bus.joypad_interrupt_requested();
+
+        let (cycles, should_tick_timers) = if self.stopped {
+            let should_wake = joypad_requested && !self.stop_joypad_latch;
+            self.stop_joypad_latch = joypad_requested;
+
+            if should_wake {
+                self.stopped = false;
+                (self.run_active_cycle(bus, pending), true)
+            } else {
+                (4, false)
+            }
+        } else {
+            self.stop_joypad_latch = joypad_requested;
+            (self.run_active_cycle(bus, pending), true)
+        };
+
+        if should_tick_timers {
+            bus.tick_timers(cycles);
+        }
+        cycles
+    }
+
+    fn run_active_cycle(&mut self, bus: &mut Bus, pending: u8) -> u8 {
+        if self.halted {
             if pending == 0 {
                 4
             } else {
@@ -95,10 +125,7 @@ impl Cpu {
             self.service_interrupt(bus, pending)
         } else {
             self.execute_next_instruction(bus)
-        };
-
-        bus.tick_timers(cycles);
-        cycles
+        }
     }
 
     fn execute_next_instruction(&mut self, bus: &mut Bus) -> u8 {

@@ -2287,6 +2287,406 @@ fn test_halt_not_entered_when_interrupt_pending_and_ime_enabled() {
 }
 
 #[test]
+fn test_stop_consumes_second_byte_and_enters_stop_mode() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0002);
+}
+
+#[test]
+fn test_stop_consumes_non_zero_second_byte_and_enters_stop_mode() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x99); // Non-zero STOP second byte
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0002);
+}
+
+#[test]
+fn test_stop_clears_halt_state_and_halt_bug() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x76); // HALT
+    bus.write(0x0001, 0x10); // STOP
+    bus.write(0x0002, 0x00); // STOP second byte
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.halt_bug);
+    assert!(!cpu.halted);
+    assert_eq!(cpu.registers.pc, 0x0001);
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert!(!cpu.halted);
+    assert!(!cpu.halt_bug);
+    assert_eq!(cpu.registers.pc, 0x0002);
+}
+
+#[test]
+fn test_stop_idles_without_wake_request() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    cpu.ime = true;
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank
+    let sp = cpu.registers.sp;
+    let iflags = bus.read(0xFF0F);
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert!(cpu.ime);
+    assert!(!cpu.halted);
+    assert!(!cpu.halt_bug);
+    assert_eq!(cpu.registers.pc, 0x0002);
+    assert_eq!(cpu.registers.sp, sp);
+    assert_eq!(bus.read(0xFF0F), iflags);
+}
+
+#[test]
+fn test_stop_idle_does_not_tick_divider() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+    let pc = cpu.registers.pc;
+    let div = bus.read(0xFF04);
+
+    for _ in 0..64 {
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 4);
+    }
+
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, pc);
+    assert_eq!(bus.read(0xFF04), div);
+}
+
+#[test]
+fn test_stop_idle_does_not_tick_tima_or_request_timer_interrupt() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0xFF05, 0xFE); // TIMA
+    bus.write(0xFF06, 0x99); // TMA
+    bus.write(0xFF07, 0b0000_0101); // TAC: enable, 16-cycle period
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+    let pc = cpu.registers.pc;
+    let tima = bus.read(0xFF05);
+    let iflags = bus.read(0xFF0F);
+
+    for _ in 0..8 {
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 4);
+    }
+
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, pc);
+    assert_eq!(bus.read(0xFF05), tima);
+    assert_eq!(bus.read(0xFF0F), iflags);
+}
+
+#[test]
+fn test_stop_wakes_on_joypad_request_when_ime_disabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFFFF, 0b0000_0000); // IE disabled
+    bus.write(0xFF0F, 0b0001_0000); // IF Joypad
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+}
+
+#[test]
+fn test_stop_does_not_wake_on_non_joypad_request() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFFFF, 0b0000_0001); // IE VBlank
+    bus.write(0xFF0F, 0b0000_0001); // IF VBlank only
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.b, 0);
+    assert_eq!(cpu.registers.pc, 0x0002);
+    assert_eq!(bus.read(0xFF0F), 0b0000_0001);
+}
+
+#[test]
+fn test_stop_wakes_without_servicing_when_ime_enabled_but_interrupt_disabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.ime = true;
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFFFF, 0b0000_0000); // IE disabled
+    bus.write(0xFF0F, 0b0001_0000); // IF Joypad
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert!(cpu.ime);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(cpu.registers.sp, 0xFFFE);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+}
+
+#[test]
+fn test_stop_wakes_on_joypad_edge_when_ime_disabled_and_ie_enabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFFFF, 0b0001_0000); // IE Joypad
+    bus.write(0xFF0F, 0b0001_0000); // IF Joypad
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 1);
+    assert_eq!(cpu.registers.sp, 0xFFFE);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000);
+}
+
+#[test]
+fn test_stop_only_wakes_once_for_stale_joypad_request() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x04); // INC B
+    bus.write(0x0003, 0x10); // STOP
+    bus.write(0x0004, 0x00); // STOP second byte
+    bus.write(0x0005, 0x04); // INC B
+    bus.write(0xFF0F, 0b0001_0000); // IF Joypad, already set before first STOP
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    bus.write(0xFF0F, 0);
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    bus.write(0xFF0F, 0b0001_0000);
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0003);
+    assert_eq!(cpu.registers.b, 1);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0005);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0005);
+    assert_eq!(cpu.registers.b, 1);
+
+    bus.write(0xFF0F, 0);
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0b0001_0000);
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.b, 2);
+    assert_eq!(cpu.registers.pc, 0x0006);
+}
+
+#[test]
+fn test_stop_wakes_and_services_interrupt_when_ime_enabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.ime = true;
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0002);
+
+    bus.write(0xFFFF, 0b0001_0000); // IE Joypad
+    bus.write(0xFF0F, 0b0001_0000); // IF Joypad
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 20);
+    assert!(!cpu.stopped);
+    assert!(!cpu.ime);
+    assert!(!cpu.halted);
+    assert!(!cpu.halt_bug);
+    assert_eq!(cpu.registers.pc, 0x0060);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x00);
+    assert_eq!(bus.read(0xFFFC), 0x02);
+    assert_eq!(bus.read(0xFF0F), 0);
+}
+
+#[test]
+fn test_stop_not_entered_when_interrupt_pending_and_ime_enabled() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.ime = true;
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0xFFFF, 0b0001_0000); // IE Joypad
+    bus.write(0xFF0F, 0b0001_0000); // IF Joypad
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 20);
+    assert!(!cpu.stopped);
+    assert!(!cpu.ime);
+    assert_eq!(cpu.registers.pc, 0x0060);
+    assert_eq!(cpu.registers.sp, 0xFFFC);
+    assert_eq!(bus.read(0xFFFD), 0x00);
+    assert_eq!(bus.read(0xFFFC), 0x00);
+    assert_eq!(bus.read(0xFF0F), 0);
+}
+
+#[test]
+fn test_stop_wake_with_multiple_pending_services_highest_priority() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    cpu.ime = true;
+    cpu.registers.sp = 0xFFFE;
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    bus.write(0xFFFF, 0b0001_0001); // IE VBlank + Joypad
+    bus.write(0xFF0F, 0b0001_0001); // IF VBlank + Joypad
+
+    let cycles = cpu.step(&mut bus);
+
+    assert_eq!(cycles, 20);
+    assert!(!cpu.stopped);
+    assert_eq!(cpu.registers.pc, 0x0040); // VBlank has higher priority than Joypad
+    assert_eq!(bus.read(0xFF0F), 0b0001_0000); // Joypad remains pending
+}
+
+#[test]
+fn test_timers_resume_after_stop_wake() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new();
+    bus.write(0x0000, 0x10); // STOP
+    bus.write(0x0001, 0x00); // STOP second byte
+    bus.write(0x0002, 0x00); // NOP
+    bus.write(0xFF05, 0x00); // TIMA
+    bus.write(0xFF07, 0b0000_0101); // TAC: enable, 16-cycle period
+
+    cpu.step(&mut bus);
+    assert!(cpu.stopped);
+
+    for _ in 0..4 {
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(cycles, 4);
+    }
+    assert_eq!(bus.read(0xFF04), 0);
+    assert_eq!(bus.read(0xFF05), 0);
+
+    bus.write(0xFF0F, 0);
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert!(cpu.stopped);
+
+    bus.write(0xFF0F, 0b0001_0000); // Joypad edge to wake
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4); // Executes NOP after wake
+    assert!(!cpu.stopped);
+    assert_eq!(bus.read(0xFF05), 0);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert_eq!(bus.read(0xFF05), 0);
+
+    let cycles = cpu.step(&mut bus);
+    assert_eq!(cycles, 4);
+    assert_eq!(bus.read(0xFF05), 1);
+}
+
+#[test]
 fn test_div_increments_every_256_cycles() {
     let mut cpu = Cpu::new();
     let mut bus = Bus::new();

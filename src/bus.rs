@@ -21,6 +21,7 @@ const TAC_ADDR: u16 = 0xFF07;
 const IF_ADDR: u16 = 0xFF0F;
 const IE_ADDR: u16 = 0xFFFF;
 const INTERRUPT_MASK: u8 = 0x1F;
+const JOYPAD_INTERRUPT_BIT: u8 = 0b0001_0000;
 const TIMER_INTERRUPT_BIT: u8 = 0b0000_0100;
 
 impl Default for Bus {
@@ -110,6 +111,16 @@ impl Bus {
         (self.read(IE_ADDR) & self.read(IF_ADDR)) & INTERRUPT_MASK
     }
 
+    #[must_use]
+    pub fn requested_interrupts(&self) -> u8 {
+        self.read(IF_ADDR) & INTERRUPT_MASK
+    }
+
+    #[must_use]
+    pub fn joypad_interrupt_requested(&self) -> bool {
+        self.requested_interrupts() & JOYPAD_INTERRUPT_BIT != 0
+    }
+
     pub fn clear_interrupt(&mut self, mask: u8) {
         let iflags = self.read(IF_ADDR);
         self.memory[usize::from(IF_ADDR)] = iflags & !(mask & INTERRUPT_MASK);
@@ -147,5 +158,24 @@ mod tests {
         let bus = Bus::new();
         assert_eq!(bus.read(0x0000), 0x00);
         assert_eq!(bus.read(0xFFFF), 0x00);
+    }
+
+    #[test]
+    fn test_requested_interrupts_masks_upper_bits() {
+        let mut bus = Bus::new();
+        bus.write(0xFF0F, 0b1110_0101);
+        assert_eq!(bus.requested_interrupts(), 0b0000_0101);
+    }
+
+    #[test]
+    fn test_joypad_interrupt_requested() {
+        let mut bus = Bus::new();
+        assert!(!bus.joypad_interrupt_requested());
+
+        bus.write(0xFF0F, 0b0001_0000);
+        assert!(bus.joypad_interrupt_requested());
+
+        bus.write(0xFF0F, 0b0000_0100);
+        assert!(!bus.joypad_interrupt_requested());
     }
 }

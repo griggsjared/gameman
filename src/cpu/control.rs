@@ -4,8 +4,11 @@ use super::Cpu;
 
 impl Cpu {
     pub(in crate::cpu) fn stop(&mut self) {
-        // Consumes the next byte (0x00) as a second opcode byte
+        // STOP consumes the next byte as a second opcode byte.
         self.registers.pc = self.registers.pc.wrapping_add(1);
+        self.halted = false;
+        self.halt_bug = false;
+        self.stopped = true;
     }
 
     pub(in crate::cpu) fn jp_hl(&mut self) {

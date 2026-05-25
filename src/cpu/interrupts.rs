@@ -41,6 +41,9 @@ impl Cpu {
         self.ime = false;
         self.ei_delay = 0;
         self.halted = false;
+        self.stopped = false;
+        self.stop_joypad_latch = false;
+        self.halt_bug = false;
 
         self.push16(self.registers.pc, bus);
         self.registers.pc = interrupt_vector(index);
