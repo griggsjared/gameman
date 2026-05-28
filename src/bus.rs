@@ -5,9 +5,12 @@
 /// The array is created on the stack inside `new()`. For most use cases
 /// (including tests) this is fine, but if stack pressure becomes an issue
 /// the field can be changed to `Box<[u8; 0x10000]>` with minimal churn.
+use crate::cartridge::Cartridge;
+
 #[derive(Debug)]
 pub struct Bus {
     memory: [u8; 0x10000],
+    cartridge: Option<Cartridge>,
     div_cycles: u16,
     div_value: u8,
     tima_cycles: u16,
@@ -48,6 +51,9 @@ const OAM_START: u16 = 0xFE00;
 const OAM_LEN: u8 = 160;
 const HRAM_START: u16 = 0xFF80;
 const HRAM_END: u16 = 0xFFFE;
+const ROM_END: u16 = 0x7FFF;
+const EXTERNAL_RAM_START: u16 = 0xA000;
+const EXTERNAL_RAM_END: u16 = 0xBFFF;
 
 impl Default for Bus {
     fn default() -> Self {
@@ -62,6 +68,7 @@ impl Bus {
     pub fn new() -> Self {
         Bus {
             memory: [0; 0x10000],
+            cartridge: None,
             div_cycles: 0,
             div_value: 0,
             tima_cycles: 0,
@@ -75,6 +82,21 @@ impl Bus {
         }
     }
 
+    /// Load a cartridge from raw ROM bytes.
+    ///
+    /// Parses the ROM header and configures MBC1 banking state. Bank 0
+    /// is not copied into `memory` — ROM reads are delegated to the
+    /// cartridge from this point forward.
+    pub fn load_cartridge(&mut self, data: &[u8]) {
+        self.cartridge = Some(Cartridge::from_bytes(data));
+    }
+
+    /// Whether a cartridge has been loaded.
+    #[must_use]
+    pub fn has_cartridge(&self) -> bool {
+        self.cartridge.is_some()
+    }
+
     /// Read a byte from the 64KB address space.
     #[must_use]
     pub fn read(&self, address: u16) -> u8 {
@@ -82,6 +104,20 @@ impl Bus {
             return 0xFF;
         }
         match address {
+            0x0000..=ROM_END => {
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_rom(address)
+                } else {
+                    self.memory[usize::from(address)]
+                }
+            }
+            EXTERNAL_RAM_START..=EXTERNAL_RAM_END => {
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_ram(address)
+                } else {
+                    0xFF
+                }
+            }
             JOYP_ADDR => self.joyp_value(),
             UNUSABLE_START..=UNUSABLE_END => UNUSABLE_READ_VALUE,
             ECHO_RAM_START..=ECHO_RAM_END => {
@@ -104,6 +140,18 @@ impl Bus {
             return;
         }
         match address {
+            0x0000..=ROM_END => {
+                if let Some(ref mut cart) = self.cartridge {
+                    cart.write_register(address, value);
+                } else {
+                    self.memory[usize::from(address)] = value;
+                }
+            }
+            EXTERNAL_RAM_START..=EXTERNAL_RAM_END => {
+                if let Some(ref mut cart) = self.cartridge {
+                    cart.write_ram(address, value);
+                }
+            }
             JOYP_ADDR => {
                 let previous_low = self.joyp_low_nibble();
                 self.joyp_select = value & JOYP_SELECT_MASK;
@@ -245,13 +293,30 @@ impl Bus {
                 return;
             }
             let src = (u16::from(self.dma_src_high) << 8) | u16::from(self.dma_index);
-            let byte = self.memory[usize::from(src)];
+            let byte = self.read_for_dma(src);
             self.memory[usize::from(OAM_START + u16::from(self.dma_index))] = byte;
             self.dma_index += 1;
         }
         if self.dma_index >= OAM_LEN {
             self.dma_active = false;
         }
+    }
+
+    /// Read a byte for DMA transfer, bypassing DMA bus restrictions.
+    ///
+    /// Delegates to the cartridge for ROM-space reads when a cartridge
+    /// is loaded, so DMA can correctly copy from switchable ROM banks.
+    #[must_use]
+    fn read_for_dma(&self, address: u16) -> u8 {
+        if let Some(ref cart) = self.cartridge {
+            if address <= ROM_END {
+                return cart.read_rom(address);
+            }
+            if (EXTERNAL_RAM_START..=EXTERNAL_RAM_END).contains(&address) {
+                return cart.read_ram(address);
+            }
+        }
+        self.memory[usize::from(address)]
     }
 
     #[must_use]
@@ -794,5 +859,122 @@ mod tests {
         bus.write(DMA_ADDR, 0xC1);
         // During active DMA, bus.read() returns 0xFF for non-HRAM; verify memory directly.
         assert_eq!(bus.memory[usize::from(DMA_ADDR)], 0xC1);
+    }
+
+    fn make_bus_with_mbc1_cart(rom_banks: usize) -> Bus {
+        assert!(
+            rom_banks.is_power_of_two(),
+            "rom_banks must be a power of 2"
+        );
+        let rom_size = 0x4000 * rom_banks;
+        let mut data = vec![0u8; rom_size];
+        data[0x0147] = 0x01; // MBC1
+        // Header byte N: total size = 32KB * 2^N, so N = log2(rom_banks / 2).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            data[0x0148] = ((rom_banks / 2) as u32).trailing_zeros() as u8;
+        }
+        data[0x0149] = 0;
+        let mut bus = Bus::new();
+        bus.load_cartridge(&data);
+        bus
+    }
+
+    #[test]
+    fn test_bus_has_cartridge_flag() {
+        let mut bus = Bus::new();
+        assert!(!bus.has_cartridge());
+        bus.load_cartridge(&vec![0u8; 0x8000]);
+        assert!(bus.has_cartridge());
+    }
+
+    #[test]
+    fn test_bus_rom_read_delegates_to_cartridge() {
+        let mut data = vec![0u8; 0x8000]; // 32KB = 2 banks
+        data[0x0147] = 0x01; // MBC1
+        data[0x0148] = 0; // 32KB
+        data[0x0149] = 0;
+        data[0x5234] = 0xAB; // Marker in bank 1
+        let mut bus = Bus::new();
+        bus.load_cartridge(&data);
+
+        // Bank 0: header type is at offset 0x0147.
+        assert_eq!(bus.read(0x0147), 0x01);
+        // Bank 1 (switchable, default = bank 1).
+        assert_eq!(bus.read(0x5234), 0xAB);
+    }
+
+    #[test]
+    fn test_bus_rom_write_goes_to_mbc_register() {
+        let mut bus = make_bus_with_mbc1_cart(4);
+        // Write to ROM bank select register.
+        bus.write(0x2000, 0x02);
+
+        // The memory array for ROM space should NOT be updated.
+        assert_eq!(bus.memory[0x2000], 0x00);
+        // But the cartridge bank should have switched.
+        assert_eq!(bus.read(0x4100), 0x00); // Bank 2, offset 0x100
+    }
+
+    #[test]
+    fn test_bus_external_ram_round_trip() {
+        let mut data = vec![0u8; 0x8000]; // 32KB = 2 banks
+        data[0x0147] = 0x02; // MBC1+RAM
+        data[0x0148] = 0; // 32KB
+        data[0x0149] = 2; // 8KB RAM
+        let mut bus = Bus::new();
+        bus.load_cartridge(&data);
+
+        // RAM is disabled by default.
+        assert_eq!(bus.read(0xA000), 0xFF);
+
+        // Enable RAM.
+        bus.write(0x0000, 0x0A);
+        bus.write(0xA000, 0x42);
+        assert_eq!(bus.read(0xA000), 0x42);
+    }
+
+    #[test]
+    fn test_bus_external_ram_returns_ff_without_cartridge() {
+        let bus = Bus::new();
+        assert_eq!(bus.read(0xA000), 0xFF);
+        assert_eq!(bus.read(0xBFFF), 0xFF);
+    }
+
+    #[test]
+    fn test_bus_rom_write_without_cartridge_still_writes_to_memory() {
+        let mut bus = Bus::new();
+        bus.write(0x1234, 0xAB);
+        assert_eq!(bus.memory[0x1234], 0xAB);
+        assert_eq!(bus.read(0x1234), 0xAB);
+    }
+
+    #[test]
+    fn test_bus_dma_reads_through_cartridge() {
+        let mut data = vec![0u8; 0x8000]; // 32KB = 2 banks
+        data[0x0147] = 0x01; // MBC1
+        data[0x0148] = 0; // 32KB
+        data[0x0149] = 0;
+        // Put a recognizable pattern in bank 1 starting at offset 0x4000.
+        for i in 0..160usize {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                data[0x4000 + i] = (i & 0xFF) as u8;
+            }
+        }
+        let mut bus = Bus::new();
+        bus.load_cartridge(&data);
+
+        // DMA source 0x40: src = (0x40 << 8) | index = 0x4000 + index.
+        bus.write(DMA_ADDR, 0x40);
+        bus.tick_timers(160);
+
+        for i in 0..160u16 {
+            assert_eq!(
+                bus.read(0xFE00 + i),
+                (i & 0xFF) as u8,
+                "DMA byte {i} mismatch"
+            );
+        }
     }
 }

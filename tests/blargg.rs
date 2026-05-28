@@ -5,18 +5,10 @@ use std::path::Path;
 use gameman::bus::Bus;
 use gameman::cpu::Cpu;
 
-/// Load a ROM file into the Bus starting at address 0x0000.
-///
-/// Only loads up to 64KB (0x10000 bytes), the full addressable space.
-#[allow(clippy::cast_possible_truncation)]
+/// Load a ROM file into the Bus via the cartridge interface.
 fn load_rom(bus: &mut Bus, path: &str) {
     let rom = fs::read(path).expect("Failed to read ROM file");
-    for (i, &byte) in rom.iter().enumerate() {
-        if i >= 0x10000 {
-            break;
-        }
-        bus.write(i as u16, byte);
-    }
+    bus.load_cartridge(&rom);
 }
 
 fn has_terminal_result(output: &str) -> bool {
