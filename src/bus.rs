@@ -11,6 +11,8 @@ use crate::cartridge::Cartridge;
 pub struct Bus {
     memory: [u8; 0x10000],
     cartridge: Option<Cartridge>,
+    boot_rom: Option<[u8; 0x100]>,
+    boot_rom_enabled: bool,
     div_cycles: u16,
     div_value: u8,
     tima_cycles: u16,
@@ -51,6 +53,8 @@ const OAM_START: u16 = 0xFE00;
 const OAM_LEN: u8 = 160;
 const HRAM_START: u16 = 0xFF80;
 const HRAM_END: u16 = 0xFFFE;
+const BOOT_ROM_END: u16 = 0x00FF;
+const BOOT_BANK_REG: u16 = 0xFF50;
 const ROM_END: u16 = 0x7FFF;
 const EXTERNAL_RAM_START: u16 = 0xA000;
 const EXTERNAL_RAM_END: u16 = 0xBFFF;
@@ -69,6 +73,8 @@ impl Bus {
         Bus {
             memory: [0; 0x10000],
             cartridge: None,
+            boot_rom: None,
+            boot_rom_enabled: false,
             div_cycles: 0,
             div_value: 0,
             tima_cycles: 0,
@@ -91,10 +97,32 @@ impl Bus {
         self.cartridge = Some(Cartridge::from_bytes(data));
     }
 
+    /// Load a 256-byte DMG boot ROM.
+    ///
+    /// When loaded, the boot ROM overlays cartridge ROM at `$0000..=$00FF`
+    /// until a write to `$FF50` disables it permanently.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() != 256`.
+    pub fn load_boot_rom(&mut self, data: &[u8]) {
+        assert_eq!(data.len(), 0x100, "boot ROM must be exactly 256 bytes");
+        let mut rom = [0u8; 0x100];
+        rom.copy_from_slice(data);
+        self.boot_rom = Some(rom);
+        self.boot_rom_enabled = true;
+    }
+
     /// Whether a cartridge has been loaded.
     #[must_use]
     pub fn has_cartridge(&self) -> bool {
         self.cartridge.is_some()
+    }
+
+    /// Whether a boot ROM has been loaded and is still active.
+    #[must_use]
+    pub fn has_boot_rom(&self) -> bool {
+        self.boot_rom.is_some() && self.boot_rom_enabled
     }
 
     /// Read a byte from the 64KB address space.
@@ -104,7 +132,19 @@ impl Bus {
             return 0xFF;
         }
         match address {
-            0x0000..=ROM_END => {
+            0x0000..=BOOT_ROM_END => {
+                if self.boot_rom_enabled
+                    && let Some(ref rom) = self.boot_rom
+                {
+                    return rom[usize::from(address)];
+                }
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_rom(address)
+                } else {
+                    self.memory[usize::from(address)]
+                }
+            }
+            0x0100..=ROM_END => {
                 if let Some(ref cart) = self.cartridge {
                     cart.read_rom(address)
                 } else {
@@ -119,6 +159,8 @@ impl Bus {
                 }
             }
             JOYP_ADDR => self.joyp_value(),
+            // Write-only register: always returns open bus (0xFF).
+            BOOT_BANK_REG => 0xFF,
             UNUSABLE_START..=UNUSABLE_END => UNUSABLE_READ_VALUE,
             ECHO_RAM_START..=ECHO_RAM_END => {
                 self.memory[usize::from(Self::mirror_echo_address(address))]
@@ -140,7 +182,18 @@ impl Bus {
             return;
         }
         match address {
-            0x0000..=ROM_END => {
+            0x0000..=BOOT_ROM_END => {
+                if self.boot_rom_enabled {
+                    // Writes to boot ROM space are ignored while boot ROM is active.
+                    return;
+                }
+                if let Some(ref mut cart) = self.cartridge {
+                    cart.write_register(address, value);
+                } else {
+                    self.memory[usize::from(address)] = value;
+                }
+            }
+            0x0100..=ROM_END => {
                 if let Some(ref mut cart) = self.cartridge {
                     cart.write_register(address, value);
                 } else {
@@ -150,6 +203,11 @@ impl Bus {
             EXTERNAL_RAM_START..=EXTERNAL_RAM_END => {
                 if let Some(ref mut cart) = self.cartridge {
                     cart.write_ram(address, value);
+                }
+            }
+            BOOT_BANK_REG => {
+                if self.boot_rom_enabled {
+                    self.boot_rom_enabled = false;
                 }
             }
             JOYP_ADDR => {
@@ -304,10 +362,17 @@ impl Bus {
 
     /// Read a byte for DMA transfer, bypassing DMA bus restrictions.
     ///
-    /// Delegates to the cartridge for ROM-space reads when a cartridge
-    /// is loaded, so DMA can correctly copy from switchable ROM banks.
+    /// Delegates to the boot ROM overlay when active, and to the cartridge
+    /// for ROM-space reads when a cartridge is loaded, so DMA can correctly
+    /// copy from switchable ROM banks.
     #[must_use]
     fn read_for_dma(&self, address: u16) -> u8 {
+        if self.boot_rom_enabled
+            && address <= BOOT_ROM_END
+            && let Some(ref rom) = self.boot_rom
+        {
+            return rom[usize::from(address)];
+        }
         if let Some(ref cart) = self.cartridge {
             if address <= ROM_END {
                 return cart.read_rom(address);

@@ -148,6 +148,24 @@ impl Cpu {
         self.registers.sp = 0xFFFE;
     }
 
+    /// Reset CPU to pre-boot state for boot ROM execution.
+    ///
+    /// On real DMG hardware, register values at power-on are undefined
+    /// (except PC=$0000). We zero them here for deterministic testing.
+    /// The boot ROM sets all registers to their correct post-boot values
+    /// before handing off to the cartridge at `$0100`.
+    pub fn reset_with_boot_rom(&mut self) {
+        self.registers = Registers::new();
+        self.ime = false;
+        self.ei_delay = 0;
+        self.halted = false;
+        self.stopped = false;
+        self.stop_joypad_latch = false;
+        self.halt_bug = false;
+        self.registers.pc = 0x0000;
+        self.registers.sp = 0x0000;
+    }
+
     /// Execute one CPU step and return consumed machine cycles.
     ///
     /// Flow:
