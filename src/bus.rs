@@ -15,6 +15,9 @@ pub struct Bus {
     joyp_select: u8,
     joyp_direction_pressed: u8,
     joyp_button_pressed: u8,
+    dma_active: bool,
+    dma_src_high: u8,
+    dma_index: u8,
 }
 
 const JOYP_ADDR: u16 = 0xFF00;
@@ -40,6 +43,11 @@ const JOYP_LOW_MASK: u8 = 0b0000_1111;
 const JOYP_UNUSED_MASK: u8 = 0b1100_0000;
 const JOYP_SELECT_DIRECTIONS: u8 = 0b0001_0000;
 const JOYP_SELECT_BUTTONS: u8 = 0b0010_0000;
+const DMA_ADDR: u16 = 0xFF46;
+const OAM_START: u16 = 0xFE00;
+const OAM_LEN: u8 = 160;
+const HRAM_START: u16 = 0xFF80;
+const HRAM_END: u16 = 0xFFFE;
 
 impl Default for Bus {
     fn default() -> Self {
@@ -61,12 +69,18 @@ impl Bus {
             joyp_select: JOYP_SELECT_MASK,
             joyp_direction_pressed: 0,
             joyp_button_pressed: 0,
+            dma_active: false,
+            dma_src_high: 0,
+            dma_index: 0,
         }
     }
 
     /// Read a byte from the 64KB address space.
     #[must_use]
     pub fn read(&self, address: u16) -> u8 {
+        if self.dma_active && !Self::is_dma_bus_allowed(address) {
+            return 0xFF;
+        }
         match address {
             JOYP_ADDR => self.joyp_value(),
             UNUSABLE_START..=UNUSABLE_END => UNUSABLE_READ_VALUE,
@@ -79,6 +93,16 @@ impl Bus {
 
     /// Write a byte into the 64KB address space.
     pub fn write(&mut self, address: u16, value: u8) {
+        if address == DMA_ADDR {
+            self.dma_active = true;
+            self.dma_src_high = value;
+            self.dma_index = 0;
+            self.memory[usize::from(DMA_ADDR)] = value;
+            return;
+        }
+        if self.dma_active && !Self::is_dma_bus_allowed(address) {
+            return;
+        }
         match address {
             JOYP_ADDR => {
                 let previous_low = self.joyp_low_nibble();
@@ -123,8 +147,10 @@ impl Bus {
         self.request_joypad_interrupt_on_falling_edge(previous_low, current_low);
     }
 
-    /// Tick timer registers by instruction cycles.
+    /// Tick timer registers and DMA transfer by instruction cycles.
     pub fn tick_timers(&mut self, cycles: u8) {
+        self.tick_dma(cycles);
+
         let cycles = u16::from(cycles);
 
         self.div_cycles = self.div_cycles.wrapping_add(cycles);
@@ -134,7 +160,7 @@ impl Bus {
             self.memory[usize::from(DIV_ADDR)] = self.div_value;
         }
 
-        let tac = self.read(TAC_ADDR);
+        let tac = self.memory[usize::from(TAC_ADDR)];
         if tac & 0b0000_0100 == 0 {
             return;
         }
@@ -145,9 +171,9 @@ impl Bus {
         while self.tima_cycles >= period {
             self.tima_cycles -= period;
 
-            let tima_value = self.read(TIMA_ADDR);
+            let tima_value = self.memory[usize::from(TIMA_ADDR)];
             if tima_value == 0xFF {
-                let reload_value = self.read(TMA_ADDR);
+                let reload_value = self.memory[usize::from(TMA_ADDR)];
                 self.memory[usize::from(TIMA_ADDR)] = reload_value;
                 self.request_interrupt(TIMER_INTERRUPT_BIT);
             } else {
@@ -158,12 +184,12 @@ impl Bus {
 
     #[must_use]
     pub fn pending_interrupts(&self) -> u8 {
-        (self.read(IE_ADDR) & self.read(IF_ADDR)) & INTERRUPT_MASK
+        (self.memory[usize::from(IE_ADDR)] & self.memory[usize::from(IF_ADDR)]) & INTERRUPT_MASK
     }
 
     #[must_use]
     pub fn requested_interrupts(&self) -> u8 {
-        self.read(IF_ADDR) & INTERRUPT_MASK
+        self.memory[usize::from(IF_ADDR)] & INTERRUPT_MASK
     }
 
     #[must_use]
@@ -172,12 +198,12 @@ impl Bus {
     }
 
     pub fn clear_interrupt(&mut self, mask: u8) {
-        let iflags = self.read(IF_ADDR);
+        let iflags = self.memory[usize::from(IF_ADDR)];
         self.memory[usize::from(IF_ADDR)] = iflags & !(mask & INTERRUPT_MASK);
     }
 
     pub fn request_interrupt(&mut self, mask: u8) {
-        let iflags = self.read(IF_ADDR);
+        let iflags = self.memory[usize::from(IF_ADDR)];
         self.memory[usize::from(IF_ADDR)] = iflags | (mask & INTERRUPT_MASK);
     }
 
@@ -201,6 +227,30 @@ impl Bus {
     fn request_joypad_interrupt_on_falling_edge(&mut self, previous_low: u8, current_low: u8) {
         if previous_low & !current_low != 0 {
             self.request_interrupt(JOYPAD_INTERRUPT_BIT);
+        }
+    }
+
+    #[must_use]
+    fn is_dma_bus_allowed(address: u16) -> bool {
+        (HRAM_START..=HRAM_END).contains(&address) || address == IE_ADDR
+    }
+
+    fn tick_dma(&mut self, cycles: u8) {
+        if !self.dma_active {
+            return;
+        }
+        for _ in 0..cycles {
+            if self.dma_index >= OAM_LEN {
+                self.dma_active = false;
+                return;
+            }
+            let src = (u16::from(self.dma_src_high) << 8) | u16::from(self.dma_index);
+            let byte = self.memory[usize::from(src)];
+            self.memory[usize::from(OAM_START + u16::from(self.dma_index))] = byte;
+            self.dma_index += 1;
+        }
+        if self.dma_index >= OAM_LEN {
+            self.dma_active = false;
         }
     }
 
@@ -569,5 +619,180 @@ mod tests {
         bus.write(0xFF00, 0b0010_0000); // Same select value
 
         assert!(!bus.joypad_interrupt_requested());
+    }
+
+    #[test]
+    fn test_oam_dma_transfers_160_bytes() {
+        let mut bus = Bus::new();
+        for i in 0..160u16 {
+            bus.memory[0x0100 + usize::from(i)] = (i & 0xFF) as u8;
+        }
+
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_timers(160);
+
+        for i in 0..160u16 {
+            assert_eq!(bus.read(0xFE00 + i), (i & 0xFF) as u8);
+        }
+        assert!(!bus.dma_active);
+    }
+
+    #[test]
+    fn test_oam_dma_transfers_in_chunks() {
+        let mut bus = Bus::new();
+        for i in 0..160u16 {
+            bus.memory[0x0100 + usize::from(i)] = (i & 0xFF) as u8;
+        }
+
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_timers(50);
+
+        for i in 0..50u16 {
+            assert_eq!(bus.memory[0xFE00 + usize::from(i)], (i & 0xFF) as u8);
+        }
+        assert_eq!(bus.memory[0xFE00 + 50], 0x00);
+        assert!(bus.dma_active);
+
+        bus.tick_timers(110);
+        assert!(!bus.dma_active);
+    }
+
+    #[test]
+    fn test_oam_dma_retrigger_aborts_previous() {
+        let mut bus = Bus::new();
+        for i in 0..160u16 {
+            bus.memory[0x0100 + usize::from(i)] = 0xAA;
+            bus.memory[0x0200 + usize::from(i)] = 0xBB;
+        }
+
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_timers(50);
+
+        bus.write(DMA_ADDR, 0x02);
+        assert_eq!(bus.dma_index, 0);
+
+        bus.tick_timers(160);
+        for i in 0..160u16 {
+            assert_eq!(bus.read(0xFE00 + i), 0xBB);
+        }
+    }
+
+    #[test]
+    fn test_oam_dma_bus_restriction_blocks_non_hram_reads() {
+        let mut bus = Bus::new();
+        bus.memory[0x0100] = 0x42;
+
+        bus.write(DMA_ADDR, 0x01);
+        assert!(bus.dma_active);
+
+        assert_eq!(bus.read(0x0100), 0xFF);
+        assert_eq!(bus.read(0x8000), 0xFF);
+        assert_eq!(bus.read(0xC000), 0xFF);
+        assert_eq!(bus.read(0xFE00), 0xFF);
+        assert_eq!(bus.read(0xFF00), 0xFF);
+    }
+
+    #[test]
+    fn test_oam_dma_bus_restriction_allows_hram_reads() {
+        let mut bus = Bus::new();
+        bus.write(0xFF80, 0x42);
+        bus.write(0xFFFF, 0x11);
+
+        bus.write(DMA_ADDR, 0x01);
+        assert!(bus.dma_active);
+
+        assert_eq!(bus.read(0xFF80), 0x42);
+        assert_eq!(bus.read(0xFFFE), 0x00);
+        assert_eq!(bus.read(0xFFFF), 0x11);
+    }
+
+    #[test]
+    fn test_oam_dma_bus_restriction_blocks_non_hram_writes() {
+        let mut bus = Bus::new();
+        bus.write(DMA_ADDR, 0x01);
+        assert!(bus.dma_active);
+
+        bus.write(0x8000, 0x42);
+        bus.write(0xC000, 0x42);
+        bus.write(0xFE00, 0x42);
+
+        assert_eq!(bus.memory[0x8000], 0x00);
+        assert_eq!(bus.memory[0xC000], 0x00);
+        assert_eq!(bus.memory[0xFE00], 0x00);
+    }
+
+    #[test]
+    fn test_oam_dma_bus_restriction_allows_hram_writes() {
+        let mut bus = Bus::new();
+
+        bus.write(DMA_ADDR, 0x01);
+        assert!(bus.dma_active);
+
+        bus.write(0xFF80, 0x42);
+        assert_eq!(bus.read(0xFF80), 0x42);
+    }
+
+    #[test]
+    fn test_oam_dma_zero_source() {
+        let mut bus = Bus::new();
+        for i in 0..160u16 {
+            bus.memory[usize::from(i)] = (i & 0xFF) as u8;
+        }
+
+        bus.write(DMA_ADDR, 0x00);
+        bus.tick_timers(160);
+
+        for i in 0..160u16 {
+            assert_eq!(bus.read(0xFE00 + i), (i & 0xFF) as u8);
+        }
+    }
+
+    #[test]
+    fn test_oam_dma_does_not_complete_without_enough_cycles() {
+        let mut bus = Bus::new();
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_timers(159);
+
+        assert!(bus.dma_active);
+        assert_eq!(bus.dma_index, 159);
+
+        bus.tick_timers(1);
+        assert!(!bus.dma_active);
+        assert_eq!(bus.dma_index, 160);
+    }
+
+    #[test]
+    fn test_oam_dma_does_not_corrupt_timer_state() {
+        let mut bus = Bus::new();
+        bus.write(TMA_ADDR, 0x42);
+        bus.write(TIMA_ADDR, 0x00);
+        bus.write(TAC_ADDR, 0b0000_0101); // enabled, period 16
+
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_timers(16);
+
+        assert_eq!(bus.memory[usize::from(TIMA_ADDR)], 0x01);
+        assert_eq!(bus.memory[usize::from(TMA_ADDR)], 0x42);
+    }
+
+    #[test]
+    fn test_oam_dma_does_not_corrupt_interrupt_flags() {
+        let mut bus = Bus::new();
+        bus.write(IF_ADDR, 0b0000_0100); // timer interrupt pending
+        bus.write(IE_ADDR, 0b0000_0101); // timer + joypad enabled
+
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_timers(1);
+
+        assert_eq!(bus.pending_interrupts(), 0b0000_0100);
+        assert_eq!(bus.requested_interrupts(), 0b0000_0100);
+    }
+
+    #[test]
+    fn test_oam_dma_read_back() {
+        let mut bus = Bus::new();
+        bus.write(DMA_ADDR, 0xC1);
+        // During active DMA, bus.read() returns 0xFF for non-HRAM; verify memory directly.
+        assert_eq!(bus.memory[usize::from(DMA_ADDR)], 0xC1);
     }
 }
