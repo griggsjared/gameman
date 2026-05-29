@@ -6,10 +6,15 @@
 /// (including tests) this is fine, but if stack pressure becomes an issue
 /// the field can be changed to `Box<[u8; 0x10000]>` with minimal churn.
 use crate::cartridge::Cartridge;
+use crate::ppu::{
+    BGP_ADDR, LCDC_ADDR, LY_ADDR, LYC_ADDR, OAM_END, OAM_START, OBP0_ADDR, OBP1_ADDR, Ppu,
+    PpuEvents, SCX_ADDR, SCY_ADDR, STAT_ADDR, VRAM_END, VRAM_START, WX_ADDR, WY_ADDR,
+};
 
 #[derive(Debug)]
 pub struct Bus {
     memory: [u8; 0x10000],
+    ppu: Ppu,
     cartridge: Option<Cartridge>,
     boot_rom: Option<[u8; 0x100]>,
     boot_rom_enabled: bool,
@@ -41,6 +46,8 @@ const UNUSABLE_END: u16 = 0xFEFF;
 // Hardware behavior varies by model and timing; refine once PPU/MMIO timing is modeled.
 const UNUSABLE_READ_VALUE: u8 = 0xFF;
 const INTERRUPT_MASK: u8 = 0x1F;
+const VBLANK_INTERRUPT_BIT: u8 = 0b0000_0001;
+const LCD_STAT_INTERRUPT_BIT: u8 = 0b0000_0010;
 const JOYPAD_INTERRUPT_BIT: u8 = 0b0001_0000;
 const TIMER_INTERRUPT_BIT: u8 = 0b0000_0100;
 const JOYP_SELECT_MASK: u8 = 0b0011_0000;
@@ -49,7 +56,6 @@ const JOYP_UNUSED_MASK: u8 = 0b1100_0000;
 const JOYP_SELECT_DIRECTIONS: u8 = 0b0001_0000;
 const JOYP_SELECT_BUTTONS: u8 = 0b0010_0000;
 const DMA_ADDR: u16 = 0xFF46;
-const OAM_START: u16 = 0xFE00;
 const OAM_LEN: u8 = 160;
 const HRAM_START: u16 = 0xFF80;
 const HRAM_END: u16 = 0xFFFE;
@@ -72,6 +78,7 @@ impl Bus {
     pub fn new() -> Self {
         Bus {
             memory: [0; 0x10000],
+            ppu: Ppu::new(),
             cartridge: None,
             boot_rom: None,
             boot_rom_enabled: false,
@@ -158,6 +165,10 @@ impl Bus {
                     0xFF
                 }
             }
+            VRAM_START..=VRAM_END => self.ppu.read_vram_cpu(address),
+            OAM_START..=OAM_END => self.ppu.read_oam_cpu(address),
+            LCDC_ADDR | STAT_ADDR | SCY_ADDR | SCX_ADDR | LY_ADDR | LYC_ADDR | BGP_ADDR
+            | OBP0_ADDR | OBP1_ADDR | WY_ADDR | WX_ADDR => self.ppu.read_io(address),
             JOYP_ADDR => self.joyp_value(),
             // Write-only register: always returns open bus (0xFF).
             BOOT_BANK_REG => 0xFF,
@@ -204,6 +215,17 @@ impl Bus {
                 if let Some(ref mut cart) = self.cartridge {
                     cart.write_ram(address, value);
                 }
+            }
+            VRAM_START..=VRAM_END => {
+                self.ppu.write_vram_cpu(address, value);
+            }
+            OAM_START..=OAM_END => {
+                self.ppu.write_oam_cpu(address, value);
+            }
+            LCDC_ADDR | STAT_ADDR | SCY_ADDR | SCX_ADDR | LY_ADDR | LYC_ADDR | BGP_ADDR
+            | OBP0_ADDR | OBP1_ADDR | WY_ADDR | WX_ADDR => {
+                let events = self.ppu.write_io(address, value);
+                self.apply_ppu_events(events);
             }
             BOOT_BANK_REG => {
                 if self.boot_rom_enabled {
@@ -253,9 +275,10 @@ impl Bus {
         self.request_joypad_interrupt_on_falling_edge(previous_low, current_low);
     }
 
-    /// Tick timer registers and DMA transfer by instruction cycles.
-    pub fn tick_timers(&mut self, cycles: u8) {
+    /// Tick DMA, PPU, and timer registers by instruction cycles.
+    pub fn tick_hardware(&mut self, cycles: u8) {
         self.tick_dma(cycles);
+        self.tick_ppu(cycles);
 
         let cycles = u16::from(cycles);
 
@@ -286,6 +309,11 @@ impl Bus {
                 self.memory[usize::from(TIMA_ADDR)] = tima_value.wrapping_add(1);
             }
         }
+    }
+
+    /// Compatibility wrapper for tests and older call sites.
+    pub fn tick_timers(&mut self, cycles: u8) {
+        self.tick_hardware(cycles);
     }
 
     #[must_use]
@@ -352,11 +380,25 @@ impl Bus {
             }
             let src = (u16::from(self.dma_src_high) << 8) | u16::from(self.dma_index);
             let byte = self.read_for_dma(src);
-            self.memory[usize::from(OAM_START + u16::from(self.dma_index))] = byte;
+            self.ppu.write_oam_dma(self.dma_index, byte);
             self.dma_index += 1;
         }
         if self.dma_index >= OAM_LEN {
             self.dma_active = false;
+        }
+    }
+
+    fn tick_ppu(&mut self, cycles: u8) {
+        let events = self.ppu.tick(cycles);
+        self.apply_ppu_events(events);
+    }
+
+    fn apply_ppu_events(&mut self, events: PpuEvents) {
+        if events.vblank_interrupt {
+            self.request_interrupt(VBLANK_INTERRUPT_BIT);
+        }
+        if events.stat_interrupt {
+            self.request_interrupt(LCD_STAT_INTERRUPT_BIT);
         }
     }
 
@@ -380,6 +422,41 @@ impl Bus {
             if (EXTERNAL_RAM_START..=EXTERNAL_RAM_END).contains(&address) {
                 return cart.read_ram(address);
             }
+        }
+        if (VRAM_START..=VRAM_END).contains(&address) {
+            return self.ppu.read_vram_direct(address);
+        }
+        if (OAM_START..=OAM_END).contains(&address) {
+            // Treat OAM-source DMA reads as open bus in this timing model.
+            return 0xFF;
+        }
+        if address == JOYP_ADDR {
+            return self.joyp_value();
+        }
+        if matches!(
+            address,
+            LCDC_ADDR
+                | STAT_ADDR
+                | SCY_ADDR
+                | SCX_ADDR
+                | LY_ADDR
+                | LYC_ADDR
+                | BGP_ADDR
+                | OBP0_ADDR
+                | OBP1_ADDR
+                | WY_ADDR
+                | WX_ADDR
+        ) {
+            return self.ppu.read_io(address);
+        }
+        if address == BOOT_BANK_REG {
+            return 0xFF;
+        }
+        if (UNUSABLE_START..=UNUSABLE_END).contains(&address) {
+            return UNUSABLE_READ_VALUE;
+        }
+        if (ECHO_RAM_START..=ECHO_RAM_END).contains(&address) {
+            return self.memory[usize::from(Self::mirror_echo_address(address))];
         }
         self.memory[usize::from(address)]
     }
@@ -544,23 +621,183 @@ mod tests {
     fn test_serial_and_lcd_register_round_trip_scaffolding() {
         let mut bus = Bus::new();
 
-        // LY (0xFF44) intentionally excluded; future PPU timing should own its semantics.
-        let writes = [
-            (0xFF01, 0xA1),
-            (0xFF02, 0x81),
-            (0xFF40, 0x91),
-            (0xFF41, 0x85),
-            (0xFF42, 0x12),
-            (0xFF43, 0x34),
-            (0xFF45, 0x78),
-            (0xFF4A, 0x9A),
-            (0xFF4B, 0xBC),
-        ];
+        let writes = [(0xFF01, 0xA1), (0xFF02, 0x81)];
 
         for (address, value) in writes {
             bus.write(address, value);
             assert_eq!(bus.read(address), value);
         }
+    }
+
+    #[test]
+    fn test_lcd_register_semantics_and_masks() {
+        let mut bus = Bus::new();
+
+        bus.write(0xFF40, 0x91);
+        bus.write(0xFF42, 0x12);
+        bus.write(0xFF43, 0x34);
+        bus.write(0xFF45, 0x78);
+        bus.write(0xFF47, 0xE4);
+        bus.write(0xFF48, 0xD2);
+        bus.write(0xFF49, 0xB1);
+        bus.write(0xFF4A, 0x9A);
+        bus.write(0xFF4B, 0xBC);
+
+        assert_eq!(bus.read(0xFF40), 0x91);
+        assert_eq!(bus.read(0xFF42), 0x12);
+        assert_eq!(bus.read(0xFF43), 0x34);
+        assert_eq!(bus.read(0xFF45), 0x78);
+        assert_eq!(bus.read(0xFF47), 0xE4);
+        assert_eq!(bus.read(0xFF48), 0xD2);
+        assert_eq!(bus.read(0xFF49), 0xB1);
+        assert_eq!(bus.read(0xFF4A), 0x9A);
+        assert_eq!(bus.read(0xFF4B), 0xBC);
+
+        bus.write(0xFF41, 0x7F);
+        let stat = bus.read(0xFF41);
+        assert_eq!(stat & 0b0111_1000, 0b0111_1000);
+        assert_eq!(stat & 0b0000_0011, 0b0000_0010);
+        assert_eq!(stat & 0b1000_0000, 0b1000_0000);
+
+        bus.tick_hardware(228);
+        bus.tick_hardware(228);
+        assert_eq!(bus.read(0xFF44), 1);
+
+        bus.write(0xFF44, 0x99);
+        assert_eq!(bus.read(0xFF44), 1);
+    }
+
+    #[test]
+    fn test_ppu_vblank_interrupt_requested_through_bus_tick() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on
+
+        for _ in 0..144 {
+            bus.tick_timers(228);
+            bus.tick_timers(228);
+        }
+
+        assert_eq!(bus.read(0xFF44), 144);
+        assert_eq!(
+            bus.requested_interrupts() & VBLANK_INTERRUPT_BIT,
+            VBLANK_INTERRUPT_BIT
+        );
+    }
+
+    #[test]
+    fn test_ppu_interrupt_requests_preserve_existing_if_bits() {
+        let mut bus = Bus::new();
+        bus.write(0xFF0F, TIMER_INTERRUPT_BIT);
+        bus.write(0xFF40, 0x80); // LCD on
+
+        for _ in 0..144 {
+            bus.tick_timers(228);
+            bus.tick_timers(228);
+        }
+
+        let iflags = bus.requested_interrupts();
+        assert_eq!(iflags & TIMER_INTERRUPT_BIT, TIMER_INTERRUPT_BIT);
+        assert_eq!(iflags & VBLANK_INTERRUPT_BIT, VBLANK_INTERRUPT_BIT);
+    }
+
+    #[test]
+    fn test_ppu_stat_interrupt_edge_requested_through_bus_writes() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on
+        bus.write(0xFF0F, 0);
+
+        bus.write(0xFF41, 0x40); // Enable LYC source while LY==LYC==0
+        assert_eq!(
+            bus.requested_interrupts() & LCD_STAT_INTERRUPT_BIT,
+            LCD_STAT_INTERRUPT_BIT
+        );
+
+        bus.write(0xFF0F, 0);
+        bus.write(0xFF41, 0x40); // No new rising edge
+        assert_eq!(bus.requested_interrupts() & LCD_STAT_INTERRUPT_BIT, 0);
+    }
+
+    #[test]
+    fn test_ppu_stat_interrupt_requested_from_mode_transition_tick() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on
+        bus.write(0xFF0F, 0);
+        bus.write(0xFF41, 0x20); // Enable mode 2 STAT source
+
+        // Clear any edge caused by enabling source at current mode.
+        bus.write(0xFF0F, 0);
+
+        // Advance one line so we re-enter mode 2 and trigger a new edge.
+        bus.tick_hardware(204);
+        assert_eq!(bus.requested_interrupts() & LCD_STAT_INTERRUPT_BIT, 0);
+
+        bus.tick_hardware(252);
+        assert_eq!(
+            bus.requested_interrupts() & LCD_STAT_INTERRUPT_BIT,
+            LCD_STAT_INTERRUPT_BIT
+        );
+    }
+
+    #[test]
+    fn test_lcd_off_does_not_request_ppu_interrupts() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x00); // LCD off
+        bus.write(0xFF0F, 0);
+
+        for _ in 0..200 {
+            bus.tick_hardware(255);
+        }
+
+        let iflags = bus.requested_interrupts();
+        assert_eq!(iflags & VBLANK_INTERRUPT_BIT, 0);
+        assert_eq!(iflags & LCD_STAT_INTERRUPT_BIT, 0);
+    }
+
+    #[test]
+    fn test_ppu_vram_oam_access_gating_by_mode_via_bus() {
+        let mut bus = Bus::new();
+
+        bus.write(0xFF40, 0x80); // LCD on; starts in mode 2
+
+        bus.write(0x8000, 0x11);
+        assert_eq!(bus.read(0x8000), 0x11);
+
+        bus.write(0xFE00, 0x22);
+        assert_eq!(bus.read(0xFE00), 0xFF);
+
+        bus.tick_timers(80); // mode 3
+        assert_eq!(bus.read(0x8000), 0xFF);
+        bus.write(0x8000, 0x33);
+
+        bus.tick_timers(172); // mode 0
+        assert_eq!(bus.read(0x8000), 0x11);
+        bus.write(0xFE00, 0x44);
+        assert_eq!(bus.read(0xFE00), 0x44);
+    }
+
+    #[test]
+    fn test_ppu_mode_boundary_fenceposts_via_bus_tick() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on -> mode 2
+
+        bus.tick_hardware(79);
+        assert_eq!(bus.read(0xFF41) & 0b11, 0b10);
+
+        bus.tick_hardware(1);
+        assert_eq!(bus.read(0xFF41) & 0b11, 0b11);
+
+        bus.tick_hardware(171);
+        assert_eq!(bus.read(0xFF41) & 0b11, 0b11);
+
+        bus.tick_hardware(1);
+        assert_eq!(bus.read(0xFF41) & 0b11, 0b00);
+
+        bus.tick_hardware(203);
+        assert_eq!(bus.read(0xFF41) & 0b11, 0b00);
+
+        bus.tick_hardware(1);
+        assert_eq!(bus.read(0xFF41) & 0b11, 0b10);
+        assert_eq!(bus.read(0xFF44), 1);
     }
 
     #[test]
@@ -778,9 +1015,9 @@ mod tests {
         bus.tick_timers(50);
 
         for i in 0..50u16 {
-            assert_eq!(bus.memory[0xFE00 + usize::from(i)], (i & 0xFF) as u8);
+            assert_eq!(bus.ppu.read_oam_direct(0xFE00 + i), (i & 0xFF) as u8);
         }
-        assert_eq!(bus.memory[0xFE00 + 50], 0x00);
+        assert_eq!(bus.ppu.read_oam_direct(0xFE00 + 50), 0x00);
         assert!(bus.dma_active);
 
         bus.tick_timers(110);
@@ -848,7 +1085,7 @@ mod tests {
 
         assert_eq!(bus.memory[0x8000], 0x00);
         assert_eq!(bus.memory[0xC000], 0x00);
-        assert_eq!(bus.memory[0xFE00], 0x00);
+        assert_eq!(bus.ppu.read_oam_direct(0xFE00), 0x00);
     }
 
     #[test]
@@ -875,6 +1112,61 @@ mod tests {
         for i in 0..160u16 {
             assert_eq!(bus.read(0xFE00 + i), (i & 0xFF) as u8);
         }
+    }
+
+    #[test]
+    fn test_oam_dma_source_in_oam_region_returns_open_bus() {
+        let mut bus = Bus::new();
+
+        // Fill destination OAM with known non-FF values.
+        bus.write(0xFF40, 0x00); // LCD off to allow CPU writes
+        for i in 0..160u16 {
+            bus.write(0xFE00 + i, 0x12);
+        }
+
+        // DMA from 0xFE00 page; source should read as open bus in this model.
+        bus.write(DMA_ADDR, 0xFE);
+        bus.tick_hardware(160);
+
+        for i in 0..160u16 {
+            assert_eq!(bus.read(0xFE00 + i), 0xFF);
+        }
+    }
+
+    #[test]
+    fn test_oam_dma_source_reads_from_echo_mirror() {
+        let mut bus = Bus::new();
+        for i in 0..160u16 {
+            bus.write(0xC000 + i, (i & 0xFF) as u8);
+        }
+
+        // Source page 0xE0 maps to 0xE000..0xE09F, which mirrors 0xC000..0xC09F.
+        bus.write(DMA_ADDR, 0xE0);
+        bus.tick_timers(160);
+
+        for i in 0..160u16 {
+            assert_eq!(bus.read(0xFE00 + i), (i & 0xFF) as u8);
+        }
+    }
+
+    #[test]
+    fn test_oam_dma_writes_oam_even_when_cpu_oam_access_blocked() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on starts mode 2 (OAM blocked for CPU)
+
+        for i in 0..160u16 {
+            bus.memory[0x0100 + usize::from(i)] = (i & 0xFF) as u8;
+        }
+
+        assert_eq!(bus.read(0xFE00), 0xFF);
+
+        bus.write(DMA_ADDR, 0x01);
+        bus.tick_hardware(160);
+
+        // CPU access is still blocked in mode 2/3, but backing OAM should be updated.
+        assert_eq!(bus.ppu.read_oam_direct(0xFE00), 0x00);
+        assert_eq!(bus.ppu.read_oam_direct(0xFE00 + 0x20), 0x20);
+        assert_eq!(bus.ppu.read_oam_direct(0xFE00 + 0x9F), 0x9F);
     }
 
     #[test]

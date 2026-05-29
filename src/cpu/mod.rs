@@ -194,7 +194,7 @@ impl Cpu {
         };
 
         if should_tick_timers {
-            bus.tick_timers(cycles);
+            bus.tick_hardware(cycles);
         }
         cycles
     }
