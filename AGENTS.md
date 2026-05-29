@@ -8,6 +8,7 @@ A Game Boy (DMG) emulator written in Rust.
 - **Testing:** Write tests to cover code you implement. Aim for good coverage of boundary conditions and edge cases.
 - **Code organization:** One concern per file/module; keep modules small and focused.
 - **Error handling:** Panic on unimplemented opcodes early in development. Move to graceful error handling in later phases.
+- **Terminology:** See `GLOSSARY.md` for emulator abbreviations and register names.
 
 ## Core Standards
 
