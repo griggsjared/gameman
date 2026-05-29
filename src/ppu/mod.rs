@@ -5,9 +5,14 @@
 //! - LCD register behavior for `FF40..=FF4B`
 //! - VRAM/OAM storage with CPU-access gating by active mode
 //! - `VBlank` and LCD `STAT` interrupt event generation
+//! - Frontend-agnostic frame buffer contract with frame-ready latching
 
 const VRAM_LEN: usize = 0x2000;
 const OAM_LEN: usize = 0xA0;
+
+pub(crate) const FRAME_WIDTH: usize = 160;
+pub(crate) const FRAME_HEIGHT: usize = 144;
+pub(crate) const FRAME_PIXELS: usize = FRAME_WIDTH * FRAME_HEIGHT;
 
 pub(crate) const VRAM_START: u16 = 0x8000;
 pub(crate) const VRAM_END: u16 = 0x9FFF;
@@ -66,6 +71,8 @@ enum PpuMode {
 pub(crate) struct Ppu {
     vram: [u8; VRAM_LEN],
     oam: [u8; OAM_LEN],
+    frame_buffer: [u8; FRAME_PIXELS],
+    frame_ready: bool,
     lcdc: u8,
     stat_select: u8,
     scy: u8,
@@ -91,10 +98,13 @@ impl Default for Ppu {
 
 impl Ppu {
     #[must_use]
+    #[allow(clippy::large_stack_arrays)]
     pub(crate) fn new() -> Self {
         Self {
             vram: [0; VRAM_LEN],
             oam: [0; OAM_LEN],
+            frame_buffer: [0; FRAME_PIXELS],
+            frame_ready: false,
             lcdc: 0,
             stat_select: 0,
             scy: 0,
@@ -180,6 +190,18 @@ impl Ppu {
         }
     }
 
+    #[must_use]
+    pub(crate) fn frame_buffer(&self) -> &[u8; FRAME_PIXELS] {
+        &self.frame_buffer
+    }
+
+    #[must_use]
+    pub(crate) fn take_frame_ready(&mut self) -> bool {
+        let frame_ready = self.frame_ready;
+        self.frame_ready = false;
+        frame_ready
+    }
+
     pub(crate) fn write_io(&mut self, address: u16, value: u8) -> PpuEvents {
         let mut events = PpuEvents::default();
 
@@ -199,11 +221,13 @@ impl Ppu {
                     self.dots_in_line = 0;
                     self.mode = PpuMode::HBlank;
                     self.ly_153_wrapped = false;
+                    self.frame_ready = false;
                 } else if !was_enabled {
                     self.ly = 0;
                     self.dots_in_line = 0;
                     self.mode = PpuMode::OamScan;
                     self.ly_153_wrapped = false;
+                    self.frame_ready = false;
                 }
 
                 if self.update_stat_irq_latch() {
@@ -299,6 +323,7 @@ impl Ppu {
         match self.ly.cmp(&144) {
             core::cmp::Ordering::Equal => {
                 self.mode = PpuMode::VBlank;
+                self.frame_ready = true;
                 events.vblank_interrupt = true;
             }
             core::cmp::Ordering::Greater => {

@@ -7,8 +7,10 @@
 /// the field can be changed to `Box<[u8; 0x10000]>` with minimal churn.
 use crate::cartridge::Cartridge;
 use crate::ppu::{
-    BGP_ADDR, LCDC_ADDR, LY_ADDR, LYC_ADDR, OAM_END, OAM_START, OBP0_ADDR, OBP1_ADDR, Ppu,
-    PpuEvents, SCX_ADDR, SCY_ADDR, STAT_ADDR, VRAM_END, VRAM_START, WX_ADDR, WY_ADDR,
+    BGP_ADDR, FRAME_HEIGHT as PPU_FRAME_HEIGHT, FRAME_PIXELS as PPU_FRAME_PIXELS,
+    FRAME_WIDTH as PPU_FRAME_WIDTH, LCDC_ADDR, LY_ADDR, LYC_ADDR, OAM_END, OAM_START, OBP0_ADDR,
+    OBP1_ADDR, Ppu, PpuEvents, SCX_ADDR, SCY_ADDR, STAT_ADDR, VRAM_END, VRAM_START, WX_ADDR,
+    WY_ADDR,
 };
 
 #[derive(Debug)]
@@ -64,6 +66,10 @@ const BOOT_BANK_REG: u16 = 0xFF50;
 const ROM_END: u16 = 0x7FFF;
 const EXTERNAL_RAM_START: u16 = 0xA000;
 const EXTERNAL_RAM_END: u16 = 0xBFFF;
+
+pub const FRAME_WIDTH: usize = PPU_FRAME_WIDTH;
+pub const FRAME_HEIGHT: usize = PPU_FRAME_HEIGHT;
+pub const FRAME_PIXELS: usize = PPU_FRAME_PIXELS;
 
 impl Default for Bus {
     fn default() -> Self {
@@ -314,6 +320,17 @@ impl Bus {
     /// Compatibility wrapper for tests and older call sites.
     pub fn tick_timers(&mut self, cycles: u8) {
         self.tick_hardware(cycles);
+    }
+
+    /// Returns the latest full-frame DMG shade buffer (160x144, row-major).
+    #[must_use]
+    pub fn frame_buffer(&self) -> &[u8; FRAME_PIXELS] {
+        self.ppu.frame_buffer()
+    }
+
+    /// Returns whether a new frame reached `VBlank` since the last call.
+    pub fn take_frame_ready(&mut self) -> bool {
+        self.ppu.take_frame_ready()
     }
 
     #[must_use]
@@ -682,6 +699,68 @@ mod tests {
             bus.requested_interrupts() & VBLANK_INTERRUPT_BIT,
             VBLANK_INTERRUPT_BIT
         );
+        assert!(bus.take_frame_ready());
+        assert!(!bus.take_frame_ready());
+    }
+
+    #[test]
+    fn test_frame_buffer_exposed_with_expected_shape() {
+        let bus = Bus::new();
+        assert_eq!(bus.frame_buffer().len(), FRAME_PIXELS);
+        assert!(bus.frame_buffer().iter().all(|&pixel| pixel == 0));
+    }
+
+    #[test]
+    fn test_take_frame_ready_false_at_start_and_with_lcd_off() {
+        let mut bus = Bus::new();
+
+        assert!(!bus.take_frame_ready());
+
+        bus.write(0xFF40, 0x00); // LCD off
+        for _ in 0..20 {
+            bus.tick_hardware(255);
+        }
+
+        assert!(!bus.take_frame_ready());
+    }
+
+    #[test]
+    fn test_take_frame_ready_once_per_frame_across_consecutive_frames() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on
+
+        for _ in 0..144 {
+            bus.tick_hardware(228);
+            bus.tick_hardware(228);
+        }
+
+        assert!(bus.take_frame_ready());
+        assert!(!bus.take_frame_ready());
+
+        for _ in 0..154 {
+            bus.tick_hardware(228);
+            bus.tick_hardware(228);
+        }
+
+        assert!(bus.take_frame_ready());
+        assert!(!bus.take_frame_ready());
+    }
+
+    #[test]
+    fn test_take_frame_ready_cleared_by_lcd_disable_and_reenable() {
+        let mut bus = Bus::new();
+        bus.write(0xFF40, 0x80); // LCD on
+
+        for _ in 0..144 {
+            bus.tick_hardware(228);
+            bus.tick_hardware(228);
+        }
+
+        bus.write(0xFF40, 0x00); // LCD off should clear pending frame latch
+        assert!(!bus.take_frame_ready());
+
+        bus.write(0xFF40, 0x80); // LCD on reset path should also clear latch
+        assert!(!bus.take_frame_ready());
     }
 
     #[test]
